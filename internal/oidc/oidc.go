@@ -34,6 +34,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/holdfast/sluice/internal/accesslog"
+	"github.com/holdfast/sluice/internal/audit"
 	"github.com/holdfast/sluice/internal/auth"
 )
 
@@ -68,6 +69,10 @@ type Config struct {
 	SessionTTL    time.Duration // gateway session lifetime
 	SessionSecret string        // HMAC key for the signed cookie id
 	CookieName    string        // defaults to DefaultCookieName
+
+	// Auditor is the non-blocking audit emitter. When nil, the relying party
+	// emits no audit events (and behaves exactly as before).
+	Auditor *audit.Emitter
 }
 
 // keyResolver supplies RSA public keys by kid for id_token signature validation.
@@ -89,6 +94,7 @@ type Provider struct {
 	signer       signer
 	parser       *jwt.Parser
 	log          *slog.Logger
+	audit        *audit.Emitter
 
 	// Overridable seams for deterministic tests.
 	now  func() time.Time
@@ -158,6 +164,7 @@ func NewProvider(cfg Config, keys keyResolver, client *http.Client, sessions Ses
 		signer:       signer{key: secret},
 		parser:       parser,
 		log:          log,
+		audit:        cfg.Auditor,
 		now:          time.Now,
 		rand:         rand.Reader,
 	}, nil
@@ -252,12 +259,14 @@ func (p *Provider) beginAuth(w http.ResponseWriter, r *http.Request) {
 func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	if e := qs.Get("error"); e != "" {
+		p.auditDeny("authorization error")
 		http.Error(w, "authorization failed: "+sanitize(e), http.StatusUnauthorized)
 		return
 	}
 	state := qs.Get("state")
 	code := qs.Get("code")
 	if state == "" || code == "" {
+		p.auditDeny("missing state or code")
 		http.Error(w, "missing state or code", http.StatusBadRequest)
 		return
 	}
@@ -269,6 +278,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		// Unknown or already-redeemed state == CSRF/replay; fail closed.
+		p.auditDeny("invalid state")
 		http.Error(w, "invalid or expired authorization state", http.StatusBadRequest)
 		return
 	}
@@ -276,6 +286,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	tok, err := p.exchangeCode(r.Context(), code, st.CodeVerifier)
 	if err != nil {
 		p.log.Warn("oidc: code exchange failed", "error", err)
+		p.auditDeny("code exchange failed")
 		http.Error(w, "authorization code exchange failed", http.StatusBadGateway)
 		return
 	}
@@ -283,6 +294,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	claims, err := p.validateIDToken(r.Context(), tok.IDToken, st.Nonce)
 	if err != nil {
 		p.log.Warn("oidc: id_token validation failed", "error", err)
+		p.auditDeny("invalid id_token")
 		http.Error(w, "invalid id_token", http.StatusBadGateway)
 		return
 	}
@@ -306,6 +318,12 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "auth temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	p.audit.Emit(audit.Event{
+		Actor:    actorOr(claims.Subject, claims.Email),
+		Action:   audit.ActionSSOEstablish,
+		Target:   p.cfg.ClientID,
+		Severity: audit.SeverityInfo,
+	})
 	p.setCookie(w, p.signer.sign(id), int(p.cfg.SessionTTL.Seconds()))
 	http.Redirect(w, r, safeReturn(st.OriginalURL), http.StatusFound)
 }
@@ -313,13 +331,46 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 // handleLogout clears the session (best-effort) and the cookie, then returns the
 // browser to root.
 func (p *Provider) handleLogout(w http.ResponseWriter, r *http.Request) {
+	sub := ""
 	if c, err := r.Cookie(p.cfg.CookieName); err == nil {
 		if id, ok := p.signer.verify(c.Value); ok {
+			// Best-effort identity lookup so the audit event names the subject.
+			if sess, found, _ := p.sessions.GetSession(r.Context(), id); found {
+				sub = sess.Sub
+			}
 			_ = p.sessions.DeleteSession(r.Context(), id)
 		}
 	}
+	p.audit.Emit(audit.Event{
+		Actor:    actorOr(sub, "anonymous"),
+		Action:   audit.ActionSSOLogout,
+		Target:   p.cfg.ClientID,
+		Severity: audit.SeverityInfo,
+	})
 	p.setCookie(w, "", -1)
 	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// auditDeny emits an sso.session.deny with a short, safe reason. The actor is
+// anonymous because a failed callback never established an identity, and detail
+// never carries token/code/secret material.
+func (p *Provider) auditDeny(reason string) {
+	p.audit.Emit(audit.Event{
+		Actor:    "anonymous",
+		Action:   audit.ActionSSODeny,
+		Target:   p.cfg.ClientID,
+		Severity: audit.SeverityWarning,
+		Detail:   reason,
+	})
+}
+
+// actorOr returns primary if non-empty, else the fallback. Used so an event
+// names sub when known and degrades to email/"anonymous" otherwise.
+func actorOr(primary, fallback string) string {
+	if primary != "" {
+		return primary
+	}
+	return fallback
 }
 
 // exchangeCode performs the client_secret_post token request against the INTERNAL

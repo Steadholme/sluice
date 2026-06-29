@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/holdfast/sluice/internal/accesslog"
+	"github.com/holdfast/sluice/internal/audit"
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
 	"github.com/holdfast/sluice/internal/oidc"
@@ -25,10 +26,13 @@ type routeHandler struct {
 //     fail closed (503) so the rest of the gateway keeps serving.
 //   - Transport is the mTLS http.Transport used for https upstreams (the internal
 //     Keystone hop); when nil, https upstreams use the default transport.
+//   - Auditor is the non-blocking audit emitter; when nil, no audit events are
+//     emitted (and the request path is identical).
 type Options struct {
 	Verifier  *auth.Verifier
 	Provider  *oidc.Provider
 	Transport *http.Transport
+	Auditor   *audit.Emitter
 }
 
 // Server is the assembled Sluice HTTP handler: /healthz, the gateway-owned
@@ -65,7 +69,7 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 func authWrap(route config.Route, proxy http.Handler, opts Options) http.Handler {
 	switch route.Auth {
 	case config.AuthBearer:
-		return auth.Middleware(opts.Verifier, proxy)
+		return auth.Middleware(opts.Verifier, proxy, auth.WithAuditor(opts.Auditor))
 	case config.AuthSSO:
 		if opts.Provider == nil {
 			// Fail closed: SSO requested but the relying party is not configured.

@@ -12,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/holdfast/sluice/internal/audit"
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
 	"github.com/holdfast/sluice/internal/gateway"
@@ -72,16 +73,30 @@ func main() {
 	cancel()
 	verifier := auth.NewVerifier(jwks, cfg.KeystoneIssuer)
 
+	// Non-blocking audit emitter (env-toggled by AUDIT_ENABLED). When off it is a
+	// no-op; when on it fire-and-forget POSTs security events to Watchtower without
+	// ever touching the request path. Watchtower being down can never break login
+	// or proxying.
+	auditor := audit.New(audit.Config{
+		Enabled: cfg.AuditEnabled,
+		URL:     cfg.WatchtowerURL,
+		Token:   cfg.AuditIngestToken,
+		Source:  audit.SourceSluice,
+		Log:     log,
+	})
+	defer auditor.Close()
+
 	// OIDC browser-SSO relying party (env-toggled by GW_OIDC). Built best-effort:
 	// a misconfiguration disables SSO (sso routes fail closed) but never blocks the
 	// bearer/public paths from starting.
-	provider, closeProvider := buildProvider(cfg, jwks, internalClient, log)
+	provider, closeProvider := buildProvider(cfg, jwks, internalClient, auditor, log)
 	defer closeProvider()
 
 	srv := gateway.NewServer(routeStore, gateway.Options{
 		Verifier:  verifier,
 		Provider:  provider,
 		Transport: mtlsTransport,
+		Auditor:   auditor,
 	})
 
 	log.Info("sluice listening",
@@ -91,6 +106,7 @@ func main() {
 		"routes", len(routeStore.Routes()),
 		"internal_mtls", mtlsTransport != nil,
 		"oidc_sso", provider != nil,
+		"audit", cfg.AuditEnabled,
 	)
 	if err := serve(log, cfg, srv.Handler()); err != nil {
 		log.Error("server stopped", "error", err)
@@ -204,7 +220,7 @@ func buildInternalMTLS(cfg *config.Config, log *slog.Logger) (*http.Transport, *
 // in-memory store otherwise. Any failure logs and returns a nil provider (SSO
 // routes then fail closed) plus a no-op closer, so the gateway still serves the
 // bearer/public paths. The returned closer releases the Postgres pool, if any.
-func buildProvider(cfg *config.Config, jwks *auth.JWKSCache, client *http.Client, log *slog.Logger) (*oidc.Provider, func()) {
+func buildProvider(cfg *config.Config, jwks *auth.JWKSCache, client *http.Client, auditor *audit.Emitter, log *slog.Logger) (*oidc.Provider, func()) {
 	noop := func() {}
 	if !cfg.GWOIDCEnabled {
 		return nil, noop
@@ -235,6 +251,7 @@ func buildProvider(cfg *config.Config, jwks *auth.JWKSCache, client *http.Client
 		RedirectURI:   cfg.GWRedirectURI,
 		SessionTTL:    cfg.GWSessionTTL,
 		SessionSecret: cfg.GWSessionSecret,
+		Auditor:       auditor,
 	}, jwks, client, sessions, states, log)
 	if err != nil {
 		log.Error("oidc browser SSO disabled (provider build failed); sso routes will 503", "error", err)

@@ -2,10 +2,14 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
+	"github.com/golang-jwt/jwt/v5"
+
 	"github.com/holdfast/sluice/internal/accesslog"
+	"github.com/holdfast/sluice/internal/audit"
 )
 
 // contextKey is a private type for context keys defined in this package.
@@ -53,6 +57,21 @@ func SubjectFromContext(ctx context.Context) string {
 	return ""
 }
 
+// Option configures optional Middleware collaborators without breaking the
+// existing Middleware(v, next) call sites.
+type Option func(*options)
+
+type options struct {
+	auditor *audit.Emitter
+}
+
+// WithAuditor wires a non-blocking audit emitter onto the middleware. A nil
+// emitter (or omitting the option) disables emission. It never affects the
+// request path: emits are fire-and-forget.
+func WithAuditor(a *audit.Emitter) Option {
+	return func(o *options) { o.auditor = a }
+}
+
 // Middleware returns a forward-auth handler wrapping next. It requires a valid
 // "Authorization: Bearer <jwt>" header verified by v. On success it stores the
 // verified Identity in the request context and calls next; the proxy is the
@@ -61,15 +80,39 @@ func SubjectFromContext(ctx context.Context) string {
 // headers can never reach the upstream. Every failure maps to a single 401 +
 // WWW-Authenticate: Bearer response with no information leak, and the upstream
 // is never reached.
-func Middleware(v *Verifier, next http.Handler) http.Handler {
+//
+// When an audit emitter is supplied (WithAuditor), every decision is emitted
+// fire-and-forget: forward_auth.allow on success (actor=sub) and
+// forward_auth.deny on rejection (actor=anonymous, detail=reason). The raw token
+// is NEVER recorded.
+func Middleware(v *Verifier, next http.Handler, opts ...Option) http.Handler {
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	em := o.auditor
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, ok := bearerToken(r.Header.Get("Authorization"))
 		if !ok {
+			em.Emit(audit.Event{
+				Actor:    "anonymous",
+				Action:   audit.ActionForwardAuthDeny,
+				Target:   r.URL.Path,
+				Severity: audit.SeverityWarning,
+				Detail:   "missing token",
+			})
 			unauthorized(w)
 			return
 		}
 		claims, err := v.Validate(r.Context(), raw)
 		if err != nil {
+			em.Emit(audit.Event{
+				Actor:    "anonymous",
+				Action:   audit.ActionForwardAuthDeny,
+				Target:   r.URL.Path,
+				Severity: audit.SeverityWarning,
+				Detail:   denyReason(err),
+			})
 			unauthorized(w)
 			return
 		}
@@ -78,10 +121,26 @@ func Middleware(v *Verifier, next http.Handler) http.Handler {
 		// Surface the verified subject to the access log (mutable per-request
 		// record installed by the outer accesslog.Wrap handler).
 		accesslog.SetSubject(r.Context(), claims.Subject)
+		em.Emit(audit.Event{
+			Actor:    claims.Subject,
+			Action:   audit.ActionForwardAuthAllow,
+			Target:   r.URL.Path,
+			Severity: audit.SeverityInfo,
+		})
 
 		ctx := ContextWithIdentity(r.Context(), id)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// denyReason maps a verification error to a short, safe label for the audit
+// detail. It distinguishes an expired token from any other invalid token; it
+// never includes the token or the underlying error text.
+func denyReason(err error) string {
+	if errors.Is(err, jwt.ErrTokenExpired) {
+		return "expired"
+	}
+	return "invalid token"
 }
 
 // bearerToken extracts the token from an Authorization header value. The scheme
