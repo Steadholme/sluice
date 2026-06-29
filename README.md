@@ -6,8 +6,10 @@ Sluice 是 Holdfast 平台的 L7 反向代理 / SSO 网关（v0），基于 Go �
 
 ## 它是什么
 
-- 配置驱动的反向代理：路由表来自 JSON 配置文件，匹配规则为「Host 精确匹配（可选）+ 最长
-  `path_prefix` 优先」。
+- 配置驱动的反向代理 / **子域名 vhost**：路由表来自 JSON 配置文件，匹配规则为「**Host 为主键**
+  + 主机内最长 `path_prefix` 优先」——请求被路由到 Host 精确匹配的路由（精确 Host 永远压过
+  无 Host 的兜底路由，即便后者前缀更长）；每个服务挂在各自子域名根（无 path 前缀），上游收到
+  **未改写的原始路径**。
 - 对匹配到的请求做流式代理（保留 method/body/headers），并写入 `X-Forwarded-For/Proto/Host`。
 - 对受保护路由执行 forward-auth：要求 `Authorization: Bearer <jwt>`，用 Keystone 的 JWKS
   （通过 OIDC discovery 发现 `jwks_uri`，按 `kid` 缓存）校验 RS256 签名，并验证 `iss` 与 `exp`；
@@ -45,7 +47,8 @@ go run ./cmd/sluice -config config.json
 | `JWKS_ROTATION_COOLDOWN` | 健康缓存遇未知 kid 时的**反应式**刷新冷却（Go duration，如 `5s`） | `5s` |
 | `TLS_MODE` | TLS 终止模式：`off` / `file` / `acme` | `off` |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | `file` 模式的证书链与私钥（PEM） | 空 |
-| `ACME_DOMAIN` | `acme` 模式允许签发的唯一主机（HostPolicy 白名单） | 空 |
+| `ACME_DOMAIN` | `acme` 模式额外并入允许集的主机（兼容旧配置 + healthcheck 的回环 SNI）；HostPolicy 现为**动态**（路由表所有 Host ∪ apex ∪ 本值） | 空 |
+| `COOKIE_DOMAIN` | 网关会话 cookie 的 `Domain` 属性（一次登录覆盖全部 `*.w33d.xyz`）；显式留空则为 host-only | `.w33d.xyz` |
 | `ACME_EMAIL` | `acme` 账户联系邮箱 | 空 |
 | `ACME_CACHE_DIR` | autocert 缓存目录（已签发证书 + 账户密钥） | `/acme` |
 | `ACME_DIRECTORY_URL` | 可选 ACME directory（如 LE staging），用于不烧生产额度地验证签发 | 空（= LE 生产） |
@@ -61,7 +64,7 @@ go run ./cmd/sluice -config config.json
 | `GW_REDIRECT_URI` | **公网** 回调地址，须为 `https://id.w33d.xyz/_gw/auth/callback` | 空 |
 | `GW_TOKEN_URL` | **内网** token 端点（开 mTLS 时 `https://keystone:8443/token`，否则 `http://keystone:8080/token`） | 空 |
 | `GW_SESSION_TTL` | 网关浏览器会话有效期（Go duration，如 `8h`） | `8h` |
-| `GW_SESSION_SECRET` | 签名 `__Host-gw` 不透明 cookie id 的 HMAC 密钥（强随机、稳定） | 空（缺省临时随机，重启失效） |
+| `GW_SESSION_SECRET` | 签名 `__Secure-gw` 不透明 cookie id 的 HMAC 密钥（强随机、稳定） | 空（缺省临时随机，重启失效） |
 | `INTERNAL_MTLS` | 到 Keystone 内网跳启用 **mTLS**：`on`/`off` | `off` |
 | `KEYSTONE_MTLS_CERT` / `KEYSTONE_MTLS_KEY` | Keyward 签发的客户端证书 + 私钥（CN=sluice，PEM） | 空 |
 | `KEYSTONE_MTLS_CA` | 信任锚 PEM（Keyward root CA） | 空 |
@@ -80,9 +83,13 @@ Keystone / whoami（后者均不对外发布）。`TLS_MODE` 选择终止方式�
   HTTPS；同时在 `HTTP_ADDR`（默认 `:80`）将一切 301 跳转到 https。迭代期可用自签证书
   + `/etc/hosts id.w33d.xyz 127.0.0.1` 演练完整 HTTPS 链路。
 - **`acme`**：用 `golang.org/x/crypto/acme/autocert` 自动签发/续期 Let's Encrypt 证书，
-  HostPolicy 白名单锁定 `ACME_DOMAIN`，证书与账户密钥缓存在 `ACME_CACHE_DIR`（`/acme` 卷）；
-  `:80` 由 `autocert` 的 HTTPHandler 服务 ACME HTTP-01 挑战，其余 301 跳转到 https；`:443`
-  使用 `manager.TLSConfig()`。设 `ACME_DIRECTORY_URL` 为 LE staging 可先行验证签发再切生产。
+  HostPolicy 现为**动态多主机**——允许集 = 当前路由表里所有 `Host` ∪ apex（由 `COOKIE_DOMAIN`
+  去掉前导点得出，如 `w33d.xyz`）∪ `ACME_DOMAIN`；因此 autocert 仅对**我们真正服务的子域名**
+  按需逐主机签发证书，对其它任意 `*.w33d.xyz`（扫描器探测）的 SNI 直接拒绝、不触发签发。
+  允许集在每次握手时从 store 重新读取，路由热加载后**自动刷新**（nil 集合 fail-closed 拒绝一切）。
+  证书与账户密钥缓存在 `ACME_CACHE_DIR`（`/acme` 卷）；`:80` 由 `autocert` 的 HTTPHandler 服务
+  ACME HTTP-01 挑战，其余 301 跳转到 https；`:443` 使用 `manager.TLSConfig()`。设
+  `ACME_DIRECTORY_URL` 为 LE staging 可先行验证签发再切生产。
 
 **公网 issuer vs 内网抓取**：`KEYSTONE_ISSUER` 始终是用于校验 `iss` 的**公网**值
 （`https://id.w33d.xyz`），而 `JWKS_FETCH_URL`（或 `OIDC_DISCOVERY_URL`）让 Sluice 从**内网**
@@ -112,6 +119,26 @@ export DATABASE_URL='postgres://postgres:pw@127.0.0.1:5432/sluice'
 go run ./cmd/sluice -config config.json
 ```
 
+### 子域名 vhost 路由模型（生产目标）
+
+切换到「每服务一子域名」后，路由以 **Host 为主键**，每个服务挂在子域名根（无 path 前缀）。
+生产路由表由 deploy 经 `ROUTES_SEED`（`routes.seed.json`）写入 Postgres `routes`（`host` 列存
+精确主机）。目标主机映射：
+
+| Host | 上游 / 服务 | `auth` |
+|------|------------|--------|
+| `w33d.xyz` | Portal（启动台 / dashboard） | `sso` |
+| `id.w33d.xyz` | Keystone IdP / 登录 / OIDC（**就是 SSO 本身，永不门禁**） | `public` |
+| `status.w33d.xyz` | Beacon 公共状态页 | `public` |
+| `vitals.w33d.xyz` | Vitals 仪表盘 | `sso` |
+| `audit.w33d.xyz` | Watchtower 审计仪表盘 | `sso` |
+| `mail.w33d.xyz` | 预留给 Corvid（下个 workflow；暂占位/不路由） | — |
+
+`id.w33d.xyz` 仍是 OIDC issuer（issuer/passkey/token 不变）；网关自服务端点
+`/_gw/auth/callback`、`/_gw/auth/logout` 由 Sluice 在 `id.w33d.xyz` 上服务，
+`redirect_uri` 恒为 `https://id.w33d.xyz/_gw/auth/callback`。autocert 会按此路由表逐主机
+按需签发 LE 证书。
+
 ### 路由鉴权三模式：`public` / `bearer` / `sso`
 
 每条路由新增可选 `auth` 字段，泛化原来的 `protected` 布尔：
@@ -131,19 +158,29 @@ EXISTS` 回填，旧行 `auth=''` 仍按 `protected` 派生）。
 这是「**每个公网 base-service UI 都挂到 Keystone SSO 后面**」的机制。`auth=sso`
 的路由把**浏览器**门禁到 Keystone 登录：
 
-1. 无有效网关会话（`__Host-gw` cookie）→ 用 `authorization_code` + PKCE S256
+1. **任意子域名**上无有效网关会话（`__Secure-gw` cookie）→ 用 `authorization_code` + PKCE S256
    `302` 跳到 Keystone **公网** `OIDC_ISSUER/authorize`（带 `client_id=GW_CLIENT_ID`、
-   `redirect_uri=GW_REDIRECT_URI`、`scope="openid email profile"`、`state`、`nonce`、
-   `code_challenge`）。`{state,nonce,code_verifier,original_url}` 以 `state` 为键短时
-   持久化（Postgres `gw_oauth_state` 或内存）。
+   `redirect_uri=GW_REDIRECT_URI`（恒为 `https://id.w33d.xyz/_gw/auth/callback`）、
+   `scope="openid email profile"`、`state`、`nonce`、`code_challenge`）。
+   `{state,nonce,code_verifier,original_url}` 以 `state` 为键短时持久化（Postgres
+   `gw_oauth_state` 或内存），其中 `original_url` 为**完整的原始子域名 URL**
+   （如 `https://vitals.w33d.xyz/dashboard?x=1`）。
 2. 用户在 Keystone 完成口令/passkey 登录后带 `code` 回到 **Sluice 自服务**端点
-   `GET /_gw/auth/callback`（**不被反代**，路由匹配前拦截）：校验单次 `state`、在
-   **内网** token 端点（可走 mTLS，见下）以 `client_secret_post` + PKCE verifier 换码，
-   用共享 JWKS 校验 `id_token` 签名与 `iss==OIDC_ISSUER`/`aud==GW_CLIENT_ID`/`nonce`/`exp`，
-   建网关会话（`gw_sessions`），下发**签名不透明** `__Host-gw` cookie（`Secure`、`HttpOnly`、
-   `SameSite=Lax`），`302` 回 `original_url`。
-3. 持有效 `__Host-gw` 会话的请求 → 注入 `X-Auth-Subject` / `X-Auth-Email` /
-   `X-Auth-Scope` 并反代上游。`GET /_gw/auth/logout` 清会话与 cookie。
+   `GET /_gw/auth/callback`（由 Sluice 在 `id.w33d.xyz` 上服务，**不被反代**，路由匹配前拦截）：
+   校验单次 `state`、在**内网** token 端点（可走 mTLS，见下）以 `client_secret_post` + PKCE
+   verifier 换码，用共享 JWKS 校验 `id_token` 签名与 `iss==OIDC_ISSUER`/`aud==GW_CLIENT_ID`/
+   `nonce`/`exp`，建网关会话（`gw_sessions`），下发**签名不透明**、**域作用域** `__Secure-gw`
+   cookie（`Domain=COOKIE_DOMAIN`、`Path=/`、`Secure`、`HttpOnly`、`SameSite=Lax`），`302` 回
+   `original_url`——**可能是另一个子域名**，域 cookie 随即会在该子域名被带上，实现真正的跨子域
+   单点登录。返回目标做开放重定向防护：仅放行 cookie 域内（`*.w33d.xyz`/apex）的 https 绝对 URL，
+   其余降级为仅保留路径。
+3. 任意 `*.w33d.xyz` 子域名上持有效 `__Secure-gw` 会话的请求 → 注入 `X-Auth-Subject` /
+   `X-Auth-Email` / `X-Auth-Scope` 并反代上游。`GET /_gw/auth/logout` 清域 cookie 与会话，
+   从任意子域名都生效。
+
+> 注：cookie 前缀由 `__Host-` 改为 `__Secure-`——`__Host-` 禁止 `Domain` 属性（锁定单主机），
+> `__Secure-` 同样强制 `Secure`+HTTPS 但**允许 `Domain`**，从而把会话作用域到父域 `.w33d.xyz`。
+> 切换 cookie 名/作用域会使切换前的旧 `__Host-gw` 会话失效（用户重新登录一次）。
 
 **与 Bearer API 路径并存且互不影响**：`bearer` 路由仍只认 `Authorization: Bearer`；
 公网口令/passkey 登录 UI（反代 Keystone 的 `/login`、`/webauthn/` 等公开路由）照常工作。
@@ -223,11 +260,12 @@ scheme：`off` 走 `LISTEN_ADDR` 的明文 HTTP，`file`/`acme` 走 `HTTPS_ADDR`
 ## v0 覆盖范围
 
 - `GET /healthz` -> `200 "ok"`。
-- 配置文件驱动的路由匹配（最长前缀优先 + 可选 Host 精确匹配）。
+- 配置文件驱动的路由匹配（**Host 为主键**的子域名 vhost + 主机内最长前缀优先）。
 - 流式反向代理 + `X-Forwarded-*` 注入 + **保留原始 Host 头**（供 Keystone 构造绝对 URL）。
 - **TLS 终止三模式**（`TLS_MODE=off|file|acme`）：`file` 加载证书文件，`acme` 用 autocert 自动
-  签发 LE 证书（HostPolicy 锁定 `ACME_DOMAIN`、缓存 `/acme`、可选 staging directory）；`file`/`acme`
-  均在 `:80` 服务 ACME HTTP-01 挑战并 301 跳转 https，在 `:443` 终止 TLS。`off` 保持历史明文行为。
+  签发 LE 证书（HostPolicy **动态**=路由表 Host ∪ apex ∪ `ACME_DOMAIN`、缓存 `/acme`、可选 staging
+  directory）；`file`/`acme` 均在 `:80` 服务 ACME HTTP-01 挑战并 301 跳转 https，在 `:443` 终止
+  TLS。`off` 保持历史明文行为。
 - **前置 Keystone**：把 Keystone 公开端点作为非保护路由反代到内网 `http://keystone:8080`，演示
   `/api` 作为保护路由反代到 `http://whoami:80`（`config.holdfast.json`）。
 - **公网 issuer / 内网抓取分离**：`KEYSTONE_ISSUER` 校验公网 `iss`，`JWKS_FETCH_URL` /
@@ -274,12 +312,12 @@ internal/auth/verifier.go     基于 golang-jwt 的 RS256/iss/exp 校验
 internal/auth/middleware.go   forward-auth 中间件 + Identity（含 Email）+ ContextWithIdentity + 审计埋点（WithAuditor）
 internal/audit/audit.go       非阻塞审计发射器：有界 channel + 后台 worker，即发即忘 POST 到 Watchtower，满/宕机即丢弃
 internal/mtls/mtls.go         内网 mTLS 客户端 transport/Client 构建（Keyward 客户端证书 + root CA + ServerName）
-internal/oidc/oidc.go         OIDC 浏览器 SSO Relying Party：Middleware、/_gw 回调与登出、PKCE、签名 cookie、id_token 校验
+internal/oidc/oidc.go         OIDC 浏览器 SSO Relying Party：Middleware、/_gw 回调与登出、PKCE、域作用域 __Secure-gw cookie（跨子域）、完整 original_url 返回 + 开放重定向防护、id_token 校验
 internal/oidc/store.go        gw 会话/状态接口 + 内存实现（测试/静态部署）
 internal/oidc/postgres.go     gw_sessions / gw_oauth_state 的 Postgres 实现（可移植标准 SQL，state 事务内单次消费）
-internal/gateway/router.go    路由匹配（Host 精确 + 最长前缀）
+internal/gateway/router.go    路由匹配（Host 为主键的子域名 vhost + 主机内最长前缀）
 internal/gateway/proxy.go     基于 ReverseProxy 的流式代理（X-Forwarded-* 注入、保留 Host、X-Auth-* 剥离/注入、https 上游挂 mTLS）
-internal/gateway/tls.go       file 模式证书加载、acme autocert.Manager 构建、:80 HTTP→HTTPS 跳转
+internal/gateway/tls.go       file 模式证书加载、acme autocert.Manager（动态多主机 HostPolicy + RouteHostSet）、:80 HTTP→HTTPS 跳转
 internal/gateway/server.go    HTTP handler 组装（healthz、/_gw 拦截、路由分发、public/bearer/sso 三模式鉴权、访问日志）
 internal/accesslog/           slog JSON 访问日志包裹器
 ```
