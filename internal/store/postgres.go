@@ -21,15 +21,23 @@ CREATE TABLE IF NOT EXISTS routes (
     host        TEXT    NOT NULL DEFAULT '',
     path_prefix TEXT    NOT NULL,
     upstream    TEXT    NOT NULL,
-    protected   BOOLEAN NOT NULL DEFAULT FALSE
+    protected   BOOLEAN NOT NULL DEFAULT FALSE,
+    auth        TEXT    NOT NULL DEFAULT ''
 )`
+
+// addAuthColumnDDL backfills the auth column on a pre-existing routes table (one
+// created before per-route auth modes existed). It is idempotent; on a fresh DB
+// the column already exists from schemaDDL. Existing rows get auth=” and the
+// loader derives the effective mode from the legacy protected flag, so behavior
+// is unchanged until a route is explicitly set to a mode (e.g. "sso").
+const addAuthColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS auth TEXT NOT NULL DEFAULT ''`
 
 const (
 	countRoutesSQL = `SELECT count(*) FROM routes`
-	upsertRouteSQL = `INSERT INTO routes (name, host, path_prefix, upstream, protected)
-VALUES ($1, $2, $3, $4, $5)
+	upsertRouteSQL = `INSERT INTO routes (name, host, path_prefix, upstream, protected, auth)
+VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (name) DO NOTHING`
-	selectRoutesSQL = `SELECT name, host, path_prefix, upstream, protected
+	selectRoutesSQL = `SELECT name, host, path_prefix, upstream, protected, auth
 FROM routes ORDER BY name`
 )
 
@@ -91,6 +99,9 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	if _, err := s.pool.Exec(ctx, schemaDDL); err != nil {
 		return fmt.Errorf("store: migrate routes table: %w", err)
 	}
+	if _, err := s.pool.Exec(ctx, addAuthColumnDDL); err != nil {
+		return fmt.Errorf("store: add auth column: %w", err)
+	}
 	return nil
 }
 
@@ -106,7 +117,7 @@ func (s *PostgresStore) seedIfEmpty(ctx context.Context, seed []config.Route) er
 	}
 	batch := &pgx.Batch{}
 	for _, r := range seed {
-		batch.Queue(upsertRouteSQL, r.Name, r.Match.Host, r.Match.PathPrefix, r.Upstream, r.Protected)
+		batch.Queue(upsertRouteSQL, r.Name, r.Match.Host, r.Match.PathPrefix, r.Upstream, r.Protected, r.Auth)
 	}
 	br := s.pool.SendBatch(ctx, batch)
 	defer br.Close()
@@ -131,7 +142,7 @@ func (s *PostgresStore) load(ctx context.Context) error {
 	var loaded []config.Route
 	for rows.Next() {
 		var r config.Route
-		if err := rows.Scan(&r.Name, &r.Match.Host, &r.Match.PathPrefix, &r.Upstream, &r.Protected); err != nil {
+		if err := rows.Scan(&r.Name, &r.Match.Host, &r.Match.PathPrefix, &r.Upstream, &r.Protected, &r.Auth); err != nil {
 			return fmt.Errorf("store: scan route: %w", err)
 		}
 		loaded = append(loaded, r)

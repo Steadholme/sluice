@@ -15,6 +15,8 @@ import (
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
 	"github.com/holdfast/sluice/internal/gateway"
+	"github.com/holdfast/sluice/internal/mtls"
+	"github.com/holdfast/sluice/internal/oidc"
 	"github.com/holdfast/sluice/internal/store"
 )
 
@@ -42,6 +44,13 @@ func main() {
 	}
 	defer closeStore()
 
+	// Internal mTLS transport/client for the Keystone hop (proxy upstream + the
+	// OIDC token/JWKS calls). Built best-effort: if INTERNAL_MTLS=on but the certs
+	// are missing/malformed, log and fall back to the plain-http path rather than
+	// taking the gateway down. internalClient (when set) carries the client cert so
+	// JWKS/token fetches to https://keystone:8443 present it.
+	mtlsTransport, internalClient := buildInternalMTLS(cfg, log)
+
 	// Build the JWKS cache + verifier. The issuer is the PUBLIC iss validated on
 	// every token; discovery/JWKS are FETCHED from cfg.DiscoveryURL (optionally an
 	// internal Keystone via OIDC_DISCOVERY_URL), and a direct JWKS_FETCH_URL — when
@@ -49,7 +58,11 @@ func main() {
 	// a TLS loopback. Warm the cache best-effort; a failure here is non-fatal
 	// because the verifier refreshes lazily on first protected request and recovers
 	// as soon as Keystone is up.
-	jwks := auth.NewJWKSCache(cfg.DiscoveryURL, &http.Client{Timeout: 10 * time.Second}, cfg.JWKSRefreshInterval,
+	jwksClient := &http.Client{Timeout: 10 * time.Second}
+	if internalClient != nil {
+		jwksClient = internalClient
+	}
+	jwks := auth.NewJWKSCache(cfg.DiscoveryURL, jwksClient, cfg.JWKSRefreshInterval,
 		auth.WithRotationCooldown(cfg.JWKSRotationCooldown),
 		auth.WithJWKSURI(cfg.JWKSFetchURL))
 	warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -59,13 +72,25 @@ func main() {
 	cancel()
 	verifier := auth.NewVerifier(jwks, cfg.KeystoneIssuer)
 
-	srv := gateway.NewServer(routeStore, verifier)
+	// OIDC browser-SSO relying party (env-toggled by GW_OIDC). Built best-effort:
+	// a misconfiguration disables SSO (sso routes fail closed) but never blocks the
+	// bearer/public paths from starting.
+	provider, closeProvider := buildProvider(cfg, jwks, internalClient, log)
+	defer closeProvider()
+
+	srv := gateway.NewServer(routeStore, gateway.Options{
+		Verifier:  verifier,
+		Provider:  provider,
+		Transport: mtlsTransport,
+	})
 
 	log.Info("sluice listening",
 		"tls_mode", cfg.TLSMode,
 		"issuer", cfg.KeystoneIssuer,
 		"store", storeKind(),
 		"routes", len(routeStore.Routes()),
+		"internal_mtls", mtlsTransport != nil,
+		"oidc_sso", provider != nil,
 	)
 	if err := serve(log, cfg, srv.Handler()); err != nil {
 		log.Error("server stopped", "error", err)
@@ -149,6 +174,76 @@ func serve(log *slog.Logger, cfg *config.Config, handler http.Handler) error {
 		errc <- nil
 	}()
 	return <-errc
+}
+
+// buildInternalMTLS builds the mTLS transport + http.Client for the internal
+// Keystone hop when INTERNAL_MTLS=on. On any build failure (missing/malformed
+// certs) it logs and returns (nil, nil) so the caller degrades to plain http,
+// keeping the gateway up. With the toggle off it is a no-op.
+func buildInternalMTLS(cfg *config.Config, log *slog.Logger) (*http.Transport, *http.Client) {
+	if !cfg.InternalMTLS {
+		return nil, nil
+	}
+	mc := mtls.Config{
+		CertFile:   cfg.KeystoneMTLSCert,
+		KeyFile:    cfg.KeystoneMTLSKey,
+		CAFile:     cfg.KeystoneMTLSCA,
+		ServerName: cfg.KeystoneTLSServerName,
+	}
+	t, err := mc.Transport()
+	if err != nil {
+		log.Error("internal mTLS disabled (transport build failed); falling back to plain http", "error", err)
+		return nil, nil
+	}
+	log.Info("internal mTLS enabled", "servername", cfg.KeystoneTLSServerName)
+	return t, &http.Client{Transport: t, Timeout: 10 * time.Second}
+}
+
+// buildProvider assembles the OIDC relying party when GW_OIDC=on. The session +
+// state store is Postgres when SLUICE_STORE=postgres (DATABASE_URL set) and the
+// in-memory store otherwise. Any failure logs and returns a nil provider (SSO
+// routes then fail closed) plus a no-op closer, so the gateway still serves the
+// bearer/public paths. The returned closer releases the Postgres pool, if any.
+func buildProvider(cfg *config.Config, jwks *auth.JWKSCache, client *http.Client, log *slog.Logger) (*oidc.Provider, func()) {
+	noop := func() {}
+	if !cfg.GWOIDCEnabled {
+		return nil, noop
+	}
+
+	var sessions oidc.SessionStore
+	var states oidc.StateStore
+	closer := noop
+	if storeKind() == config.StorePostgres {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		ps, err := oidc.NewPostgresStore(ctx, os.Getenv(config.EnvDatabaseURL))
+		if err != nil {
+			log.Error("oidc browser SSO disabled (gateway store init failed); sso routes will 503", "error", err)
+			return nil, noop
+		}
+		sessions, states, closer = ps, ps, ps.Close
+	} else {
+		mem := oidc.NewMemoryStore()
+		sessions, states = mem, mem
+	}
+
+	provider, err := oidc.NewProvider(oidc.Config{
+		Issuer:        cfg.OIDCIssuer,
+		TokenURL:      cfg.GWTokenURL,
+		ClientID:      cfg.GWClientID,
+		ClientSecret:  cfg.GWClientSecret,
+		RedirectURI:   cfg.GWRedirectURI,
+		SessionTTL:    cfg.GWSessionTTL,
+		SessionSecret: cfg.GWSessionSecret,
+	}, jwks, client, sessions, states, log)
+	if err != nil {
+		log.Error("oidc browser SSO disabled (provider build failed); sso routes will 503", "error", err)
+		closer()
+		return nil, noop
+	}
+	log.Info("oidc browser SSO enabled",
+		"issuer", cfg.OIDCIssuer, "client_id", cfg.GWClientID, "token_url", cfg.GWTokenURL)
+	return provider, closer
 }
 
 // storeKind returns the configured route store kind, defaulting to static.

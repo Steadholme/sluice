@@ -30,9 +30,13 @@ const authHeaderPrefix = "X-Auth-"
 //
 // Public routes have no auth context, so all X-Auth-* headers are simply
 // stripped and never re-added.
-func newReverseProxy(route config.Route) *httputil.ReverseProxy {
+//
+// When mtls is non-nil and the upstream is https (the internal Keystone hop under
+// INTERNAL_MTLS=on), the proxy uses the mTLS transport so it presents the Keyward
+// client certificate; plain-http upstreams keep the default transport unchanged.
+func newReverseProxy(route config.Route, mtls *http.Transport) *httputil.ReverseProxy {
 	target := route.UpstreamURL()
-	return &httputil.ReverseProxy{
+	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.SetXForwarded()
@@ -53,6 +57,10 @@ func newReverseProxy(route config.Route) *httputil.ReverseProxy {
 			}
 		},
 	}
+	if mtls != nil && target.Scheme == "https" {
+		rp.Transport = mtls
+	}
+	return rp
 }
 
 // stripAuthHeaders removes every X-Auth-* header from h.

@@ -150,7 +150,7 @@ func newSluiceHandler(t *testing.T, keystone *fakeKeystone, upstream string) htt
 		t.Fatalf("warm jwks: %v", err)
 	}
 	verifier := auth.NewVerifier(jwks, cfg.KeystoneIssuer)
-	return gateway.NewServer(store.NewStaticStore(cfg.Routes), verifier).Handler()
+	return gateway.NewServer(store.NewStaticStore(cfg.Routes), gateway.Options{Verifier: verifier}).Handler()
 }
 
 // buildSluice wraps the shared handler in a plain-HTTP httptest server.
