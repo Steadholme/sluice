@@ -1,0 +1,16 @@
+# Go build artifacts (root-level built binary only; do not ignore cmd/sluice/)
+/bin/
+/sluice
+*.test
+*.out
+
+# Local runtime config (copy from config.example.json)
+/config.json
+
+# Editor / OS noise
+*.swp
+.DS_Store
+
+# Rust (none in this repo, kept for ecosystem parity)
+/target
+**/*.rs.bk
