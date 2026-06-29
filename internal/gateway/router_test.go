@@ -95,6 +95,70 @@ func TestRouterHostScopedLongerPrefixWins(t *testing.T) {
 	}
 }
 
+// TestRouterHostPrimaryBeatsLongerAgnosticPrefix proves Host is the PRIMARY key:
+// a route whose host matches exactly wins over a host-agnostic route EVEN WHEN the
+// host-agnostic route has a strictly longer path prefix. This is the subdomain
+// model where each service sits at its host root ("/").
+func TestRouterHostPrimaryBeatsLongerAgnosticPrefix(t *testing.T) {
+	s := mustRoutes(t, []config.Route{
+		// Host-agnostic, LONGER prefix.
+		{Name: "agnostic-deep", Match: config.Match{PathPrefix: "/app/deep"}, Upstream: "http://127.0.0.1:1"},
+		// Exact host, ROOT prefix (shorter).
+		{Name: "vitals-root", Match: config.Match{Host: "vitals.w33d.xyz", PathPrefix: "/"}, Upstream: "http://127.0.0.1:2", Auth: "sso"},
+	})
+	r := NewRouter(s)
+
+	// On the vitals host the exact-host root route wins despite the agnostic
+	// route's longer matching prefix.
+	got, ok := r.Match("vitals.w33d.xyz", "/app/deep/x")
+	if !ok {
+		t.Fatal("no match on vitals host")
+	}
+	if got.Name != "vitals-root" {
+		t.Errorf("vitals host matched %q, want vitals-root (host is primary)", got.Name)
+	}
+
+	// On a different host only the agnostic route is eligible.
+	got, ok = r.Match("other.w33d.xyz", "/app/deep/x")
+	if !ok {
+		t.Fatal("no match on other host")
+	}
+	if got.Name != "agnostic-deep" {
+		t.Errorf("other host matched %q, want agnostic-deep", got.Name)
+	}
+}
+
+// TestRouterHostRootSubdomainModel proves the per-subdomain root layout: distinct
+// hosts route to distinct upstreams at "/", with the path forwarded unmodified by
+// the proxy (asserted elsewhere) — here we assert host selection.
+func TestRouterHostRootSubdomainModel(t *testing.T) {
+	s := mustRoutes(t, []config.Route{
+		{Name: "portal", Match: config.Match{Host: "w33d.xyz", PathPrefix: "/"}, Upstream: "http://127.0.0.1:1", Auth: "sso"},
+		{Name: "id", Match: config.Match{Host: "id.w33d.xyz", PathPrefix: "/"}, Upstream: "http://127.0.0.1:2", Auth: "public"},
+		{Name: "status", Match: config.Match{Host: "status.w33d.xyz", PathPrefix: "/"}, Upstream: "http://127.0.0.1:3", Auth: "public"},
+	})
+	r := NewRouter(s)
+
+	for host, want := range map[string]string{
+		"w33d.xyz":        "portal",
+		"id.w33d.xyz":     "id",
+		"status.w33d.xyz": "status",
+	} {
+		got, ok := r.Match(host, "/whatever/path")
+		if !ok {
+			t.Fatalf("host %q: no match", host)
+		}
+		if got.Name != want {
+			t.Errorf("host %q matched %q, want %q", host, got.Name, want)
+		}
+	}
+
+	// A host with no route and no fallback does not match.
+	if _, ok := r.Match("unknown.w33d.xyz", "/"); ok {
+		t.Error("unknown host matched; want no match (no fallback route)")
+	}
+}
+
 func TestRouterNoMatch(t *testing.T) {
 	s := mustRoutes(t, []config.Route{
 		{Name: "api", Match: config.Match{PathPrefix: "/api"}, Upstream: "http://127.0.0.1:1"},
