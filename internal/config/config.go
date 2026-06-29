@@ -107,7 +107,8 @@ const (
 	EnvGWRedirectURI   = "GW_REDIRECT_URI"   // PUBLIC redirect_uri, e.g. https://id.w33d.xyz/_gw/auth/callback
 	EnvGWTokenURL      = "GW_TOKEN_URL"      // INTERNAL token endpoint (mTLS), e.g. https://keystone:8443/token
 	EnvGWSessionTTL    = "GW_SESSION_TTL"    // gateway session lifetime (Go duration; default 8h)
-	EnvGWSessionSecret = "GW_SESSION_SECRET" // HMAC key signing the opaque __Host-gw cookie id
+	EnvGWSessionSecret = "GW_SESSION_SECRET" // HMAC key signing the opaque __Secure-gw cookie id
+	EnvCookieDomain    = "COOKIE_DOMAIN"     // Domain attribute for the gateway session cookie (default .w33d.xyz)
 
 	EnvInternalMTLS          = "INTERNAL_MTLS"           // on|off — mTLS for the internal Keystone hop
 	EnvKeystoneMTLSCert      = "KEYSTONE_MTLS_CERT"      // client cert PEM (Keyward CN=sluice)
@@ -126,6 +127,10 @@ const (
 
 // DefaultGWSessionTTL is the gateway browser-session lifetime when unset.
 const DefaultGWSessionTTL = 8 * time.Hour
+
+// DefaultCookieDomain scopes the gateway session cookie to the parent registrable
+// domain so one login covers every *.w33d.xyz subdomain (cross-subdomain SSO).
+const DefaultCookieDomain = ".w33d.xyz"
 
 // Match describes how an incoming request is matched to a Route.
 //
@@ -196,6 +201,10 @@ type Config struct {
 	GWTokenURL      string        `json:"gw_token_url"`
 	GWSessionTTL    time.Duration `json:"gw_session_ttl"`
 	GWSessionSecret string        `json:"gw_session_secret"`
+	// CookieDomain is the Domain attribute of the gateway session cookie. Default
+	// .w33d.xyz makes one login span every subdomain; an explicit empty value (via
+	// COOKIE_DOMAIN="") keeps the cookie host-only.
+	CookieDomain string `json:"cookie_domain"`
 
 	// Internal mTLS to Keystone. Off by default; when on, the gateway presents a
 	// Keyward client cert on the internal hop (proxy upstream + token/JWKS).
@@ -341,6 +350,9 @@ func (c *Config) ApplyEnv() {
 	}
 	if v := os.Getenv(EnvGWSessionSecret); v != "" {
 		c.GWSessionSecret = v
+	}
+	if v := os.Getenv(EnvCookieDomain); v != "" {
+		c.CookieDomain = v
 	}
 
 	// Internal mTLS overrides.
@@ -509,6 +521,9 @@ func (c *Config) applyGatewayDefaults() {
 	}
 	if c.GWSessionTTL <= 0 {
 		c.GWSessionTTL = DefaultGWSessionTTL
+	}
+	if c.CookieDomain == "" {
+		c.CookieDomain = DefaultCookieDomain
 	}
 	if c.KeystoneTLSServerName == "" {
 		c.KeystoneTLSServerName = "keystone"

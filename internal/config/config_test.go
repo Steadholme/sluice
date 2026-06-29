@@ -271,6 +271,29 @@ func TestApplyEnvGatewayOIDCAndMTLS(t *testing.T) {
 	}
 }
 
+// CookieDomain defaults to the parent registrable domain (one login spans every
+// subdomain) and is overridable via COOKIE_DOMAIN.
+func TestCookieDomainDefaultAndOverride(t *testing.T) {
+	def := minimalValid()
+	def.ApplyEnv()
+	if err := def.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if def.CookieDomain != DefaultCookieDomain {
+		t.Errorf("CookieDomain = %q, want default %q", def.CookieDomain, DefaultCookieDomain)
+	}
+
+	t.Setenv(EnvCookieDomain, ".example.test")
+	c := minimalValid()
+	c.ApplyEnv()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if c.CookieDomain != ".example.test" {
+		t.Errorf("CookieDomain = %q, want .example.test (env override)", c.CookieDomain)
+	}
+}
+
 // Audit env overrides apply, and AuditEnabled stays OFF by default (so the
 // gateway emits nothing unless explicitly toggled on).
 func TestApplyEnvAuditOverrides(t *testing.T) {
