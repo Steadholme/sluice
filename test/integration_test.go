@@ -128,9 +128,10 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// buildSluice assembles a real Sluice handler with one public and one protected
-// route, both pointing at the echo upstream.
-func buildSluice(t *testing.T, keystone *fakeKeystone, upstream string) *httptest.Server {
+// newSluiceHandler assembles a real Sluice http.Handler with one public and one
+// protected route, both pointing at the echo upstream. It is the shared core
+// used by both the plain-HTTP integration server and the file-mode TLS test.
+func newSluiceHandler(t *testing.T, keystone *fakeKeystone, upstream string) http.Handler {
 	t.Helper()
 	cfg := &config.Config{
 		ListenAddr:     "127.0.0.1:0",
@@ -149,9 +150,13 @@ func buildSluice(t *testing.T, keystone *fakeKeystone, upstream string) *httptes
 		t.Fatalf("warm jwks: %v", err)
 	}
 	verifier := auth.NewVerifier(jwks, cfg.KeystoneIssuer)
-	srv := gateway.NewServer(store.NewStaticStore(cfg.Routes), verifier)
+	return gateway.NewServer(store.NewStaticStore(cfg.Routes), verifier).Handler()
+}
 
-	s := httptest.NewServer(srv.Handler())
+// buildSluice wraps the shared handler in a plain-HTTP httptest server.
+func buildSluice(t *testing.T, keystone *fakeKeystone, upstream string) *httptest.Server {
+	t.Helper()
+	s := httptest.NewServer(newSluiceHandler(t, keystone, upstream))
 	t.Cleanup(s.Close)
 	return s
 }

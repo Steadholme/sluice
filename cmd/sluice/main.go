@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -41,11 +42,16 @@ func main() {
 	}
 	defer closeStore()
 
-	// Build the JWKS cache + verifier from the Keystone issuer. Warm the cache
-	// best-effort; a failure here is non-fatal because the verifier refreshes
-	// lazily on first protected request and recovers as soon as Keystone is up.
+	// Build the JWKS cache + verifier. The issuer is the PUBLIC iss validated on
+	// every token; discovery/JWKS are FETCHED from cfg.DiscoveryURL (optionally an
+	// internal Keystone via OIDC_DISCOVERY_URL), and a direct JWKS_FETCH_URL — when
+	// set — bypasses discovery so JWKS is pulled from the internal Keystone without
+	// a TLS loopback. Warm the cache best-effort; a failure here is non-fatal
+	// because the verifier refreshes lazily on first protected request and recovers
+	// as soon as Keystone is up.
 	jwks := auth.NewJWKSCache(cfg.DiscoveryURL, &http.Client{Timeout: 10 * time.Second}, cfg.JWKSRefreshInterval,
-		auth.WithRotationCooldown(cfg.JWKSRotationCooldown))
+		auth.WithRotationCooldown(cfg.JWKSRotationCooldown),
+		auth.WithJWKSURI(cfg.JWKSFetchURL))
 	warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := jwks.Warm(warmCtx); err != nil {
 		log.Warn("jwks warm-up failed; will retry lazily", "error", err)
@@ -55,22 +61,94 @@ func main() {
 
 	srv := gateway.NewServer(routeStore, verifier)
 
-	httpServer := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
 	log.Info("sluice listening",
-		"addr", cfg.ListenAddr,
+		"tls_mode", cfg.TLSMode,
 		"issuer", cfg.KeystoneIssuer,
 		"store", storeKind(),
 		"routes", len(routeStore.Routes()),
 	)
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := serve(log, cfg, srv.Handler()); err != nil {
 		log.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+// serve binds the gateway according to cfg.TLSMode. In off mode it serves a
+// single plain HTTP listener on ListenAddr (the unchanged dev default). In file
+// and acme modes it terminates TLS on HTTPSAddr and runs an HTTP server on
+// HTTPAddr that serves the ACME HTTP-01 challenge (acme mode) and 301-redirects
+// everything else to https. It returns the first fatal listener error.
+func serve(log *slog.Logger, cfg *config.Config, handler http.Handler) error {
+	if cfg.TLSMode == config.TLSModeOff {
+		httpServer := &http.Server{
+			Addr:              cfg.ListenAddr,
+			Handler:           handler,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		log.Info("serving plain HTTP", "addr", cfg.ListenAddr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return err
+		}
+		return nil
+	}
+
+	// TLS modes: assemble the :443 TLS config and the :80 handler.
+	var tlsConf *tls.Config
+	var challengeHandler http.Handler
+	switch cfg.TLSMode {
+	case config.TLSModeACME:
+		m := gateway.NewACMEManager(cfg)
+		tlsConf = m.TLSConfig()
+		// HTTPHandler serves /.well-known/acme-challenge/* and forwards the rest
+		// to the https redirect.
+		challengeHandler = m.HTTPHandler(gateway.RedirectHTTPSHandler())
+		log.Info("acme enabled", "domain", cfg.ACMEDomain, "cache", cfg.ACMECacheDir, "directory", cfg.ACMEDirectoryURL)
+	case config.TLSModeFile:
+		var err error
+		tlsConf, err = gateway.FileTLSConfig(cfg)
+		if err != nil {
+			return err
+		}
+		challengeHandler = gateway.RedirectHTTPSHandler()
+		log.Info("file tls enabled", "cert", cfg.TLSCertFile)
+	default:
+		return fmt.Errorf("unsupported tls_mode %q", cfg.TLSMode)
+	}
+
+	httpsServer := &http.Server{
+		Addr:              cfg.HTTPSAddr,
+		Handler:           handler,
+		TLSConfig:         tlsConf,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	httpServer := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           challengeHandler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	// Run the :80 challenge/redirect server alongside the :443 TLS server; the
+	// first fatal error from either is returned.
+	errc := make(chan error, 2)
+	go func() {
+		log.Info("serving HTTP challenge/redirect", "addr", cfg.HTTPAddr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errc <- fmt.Errorf("http server: %w", err)
+			return
+		}
+		errc <- nil
+	}()
+	go func() {
+		log.Info("serving HTTPS", "addr", cfg.HTTPSAddr)
+		// Certs come from TLSConfig (file mode) or autocert (acme mode), so the
+		// cert/key file arguments are empty.
+		if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			errc <- fmt.Errorf("https server: %w", err)
+			return
+		}
+		errc <- nil
+	}()
+	return <-errc
 }
 
 // storeKind returns the configured route store kind, defaulting to static.
@@ -113,25 +191,24 @@ func buildStore(cfg *config.Config, log *slog.Logger) (store.RouteStore, func(),
 	}
 }
 
-// runHealthcheck performs an in-container liveness probe of /healthz against the
-// configured listen address. It is the entrypoint for the Docker HEALTHCHECK on
-// a scratch runtime with no shell or wget. Returns a process exit code.
+// runHealthcheck performs an in-container liveness probe of /healthz. It is the
+// entrypoint for the Docker HEALTHCHECK on a scratch runtime with no shell or
+// wget. The scheme + address follow TLS_MODE: off probes plain HTTP on
+// LISTEN_ADDR; file/acme probe HTTPS on HTTPS_ADDR (with certificate
+// verification skipped, since the loopback dial won't match the public SNI host
+// and self-signed certs are expected in file mode). Returns a process exit code.
 func runHealthcheck() int {
-	addr := os.Getenv(config.EnvListenAddr)
-	if addr == "" {
-		addr = config.DefaultListenAddr
-	}
+	scheme, addr, client := healthcheckTarget()
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "healthcheck: bad listen addr %q: %v\n", addr, err)
+		fmt.Fprintf(os.Stderr, "healthcheck: bad addr %q: %v\n", addr, err)
 		return 1
 	}
 	// A bind host of 0.0.0.0 / :: / empty is not dialable; probe loopback.
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "127.0.0.1"
 	}
-	url := fmt.Sprintf("http://%s/healthz", net.JoinHostPort(host, port))
-	client := &http.Client{Timeout: 3 * time.Second}
+	url := fmt.Sprintf("%s://%s/healthz", scheme, net.JoinHostPort(host, port))
 	resp, err := client.Get(url)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "healthcheck: GET %s: %v\n", url, err)
@@ -143,4 +220,28 @@ func runHealthcheck() int {
 		return 1
 	}
 	return 0
+}
+
+// healthcheckTarget selects the scheme, address, and HTTP client for the probe
+// based on TLS_MODE. In TLS modes it targets HTTPS_ADDR over a TLS client that
+// skips verification (loopback dial, public-host cert).
+func healthcheckTarget() (scheme, addr string, client *http.Client) {
+	timeout := 3 * time.Second
+	mode := os.Getenv(config.EnvTLSMode)
+	if mode == config.TLSModeFile || mode == config.TLSModeACME {
+		addr = os.Getenv(config.EnvHTTPSAddr)
+		if addr == "" {
+			addr = config.DefaultHTTPSAddr
+		}
+		client = &http.Client{
+			Timeout:   timeout,
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+		}
+		return "https", addr, client
+	}
+	addr = os.Getenv(config.EnvListenAddr)
+	if addr == "" {
+		addr = config.DefaultListenAddr
+	}
+	return "http", addr, &http.Client{Timeout: timeout}
 }
