@@ -66,6 +66,9 @@ go run ./cmd/sluice -config config.json
 | `KEYSTONE_MTLS_CERT` / `KEYSTONE_MTLS_KEY` | Keyward 签发的客户端证书 + 私钥（CN=sluice，PEM） | 空 |
 | `KEYSTONE_MTLS_CA` | 信任锚 PEM（Keyward root CA） | 空 |
 | `KEYSTONE_TLS_SERVERNAME` | 内网 mTLS 校验的 server name（SNI/证书主机） | `keystone` |
+| `AUDIT_ENABLED` | 启用向 Watchtower 发送**安全审计事件**：`on`/`off`（关闭即零行为变化） | `off` |
+| `WATCHTOWER_URL` | Watchtower 基址（内网，如 `http://watchtower:8500`） | 空 |
+| `AUDIT_INGEST_TOKEN` | `POST /events` 的 Bearer 凭据（与 Watchtower 共享） | 空 |
 
 ### TLS 终止与公网暴露
 
@@ -156,6 +159,32 @@ Sluice 到 Keystone 的**内网 server-to-server 跳**（反代上游 + OIDC tok
 开关 `off` 时维持原 `http://keystone:8080`。构建失败（缺证书/格式错）自动降级回明文，
 **不拖垮网关**。
 
+### 安全审计事件到 Watchtower（`AUDIT_ENABLED=on`）
+
+开启后，Sluice 把网关侧的安全相关动作以**非阻塞、即发即忘**的方式上报到 Watchtower
+（`POST WATCHTOWER_URL/events`，`Authorization: Bearer AUDIT_INGEST_TOKEN`）。Watchtower
+负责分配 `seq`/`ts` 并追加到 SHA-256 哈希链；生产者只发逻辑字段。
+
+**绝不阻塞/失败请求路径**：`internal/audit` 用一个**有界 channel（cap 1024）+ 后台
+worker**——handler 调用 `Emit` 只做一次 `select`+`default` 的非阻塞投递，队列满或
+Watchtower 不可达即**丢弃并计数**（warn 日志），错误绝不回传到用户请求。worker 以
+~2s 短超时 POST。`AUDIT_ENABLED=off`（默认）时 `Emit` 为 no-op，**零行为变化**；
+**Watchtower 宕机不影响登录与反代**。
+
+**绝不泄密**：事件字段为 `actor`/`action`/`target`/`severity`/`detail`/`source`，
+`detail` 为短安全字符串，**绝不含 token/密码/client secret/cookie/code_verifier**。
+`forward_auth.deny` 只记 reason（`missing token`/`invalid token`/`expired`），**不含 token 本体**。
+
+埋点事件（`source="sluice"`）：
+
+| action | 触发点 | actor | target | severity |
+|--------|--------|-------|--------|----------|
+| `forward_auth.allow` | bearer 路由校验通过 | 已验证 `sub` | 请求路径 | info |
+| `forward_auth.deny` | bearer 校验失败 | `anonymous` | 请求路径 | warning（`detail`=原因） |
+| `sso.session.establish` | OIDC 回调建立会话 | `sub`/`email` | `GW_CLIENT_ID` | info |
+| `sso.session.deny` | 回调 state/nonce/sig 校验失败 | `anonymous` | `GW_CLIENT_ID` | warning（`detail`=原因） |
+| `sso.logout` | `/_gw/auth/logout` | 已知则 `sub` | `GW_CLIENT_ID` | info |
+
 ### 容器运行
 
 ```bash
@@ -242,7 +271,8 @@ internal/store/postgres.go    pgx/v5 PostgresStore：幂等迁移 + 空表播种
 internal/auth/jwks.go         OIDC discovery + JWKS 抓取 + RSA 公钥重建 + kid 缓存 + singleflight/退避恢复
 Dockerfile / .dockerignore    多阶段静态构建 -> scratch 非 root 运行，-healthcheck 驱动 HEALTHCHECK
 internal/auth/verifier.go     基于 golang-jwt 的 RS256/iss/exp 校验
-internal/auth/middleware.go   forward-auth 中间件 + Identity（含 Email）+ ContextWithIdentity
+internal/auth/middleware.go   forward-auth 中间件 + Identity（含 Email）+ ContextWithIdentity + 审计埋点（WithAuditor）
+internal/audit/audit.go       非阻塞审计发射器：有界 channel + 后台 worker，即发即忘 POST 到 Watchtower，满/宕机即丢弃
 internal/mtls/mtls.go         内网 mTLS 客户端 transport/Client 构建（Keyward 客户端证书 + root CA + ServerName）
 internal/oidc/oidc.go         OIDC 浏览器 SSO Relying Party：Middleware、/_gw 回调与登出、PKCE、签名 cookie、id_token 校验
 internal/oidc/store.go        gw 会话/状态接口 + 内存实现（测试/静态部署）
