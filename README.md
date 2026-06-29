@@ -38,12 +38,57 @@ go run ./cmd/sluice -config config.json
 
 | 变量 | 作用 | 默认 |
 |------|------|------|
-| `LISTEN_ADDR` | 监听地址（覆盖 `listen_addr`） | `127.0.0.1:9090` |
-| `KEYSTONE_ISSUER` | 期望 OIDC issuer（覆盖 `keystone_issuer`，并重新派生 discovery） | `http://127.0.0.1:8080` |
-| `JWKS_ROTATION_COOLDOWN` | 健康缓存遇未知 kid 时的**反应式**刷新冷却（Go duration，如 `5s`）；冷却内视为垃圾 kid 风暴并抑制刷新，过冷却即视为 kid 轮换并立即刷新 | `5s` |
+| `LISTEN_ADDR` | 明文模式（`TLS_MODE=off`）的单一监听地址 | `127.0.0.1:9090` |
+| `KEYSTONE_ISSUER` | 期望的**公网** OIDC issuer（校验 JWT `iss`，并重新派生 discovery） | `http://127.0.0.1:8080` |
+| `OIDC_DISCOVERY_URL` | 覆盖 discovery 文档抓取 URL（指向**内网** Keystone，避免 TLS 回环） | 由 issuer 派生 |
+| `JWKS_FETCH_URL` | 直接指定 `jwks_uri`，**完全跳过 discovery**（指向内网 Keystone 的 `/jwks.json`） | 空 |
+| `JWKS_ROTATION_COOLDOWN` | 健康缓存遇未知 kid 时的**反应式**刷新冷却（Go duration，如 `5s`） | `5s` |
+| `TLS_MODE` | TLS 终止模式：`off` / `file` / `acme` | `off` |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | `file` 模式的证书链与私钥（PEM） | 空 |
+| `ACME_DOMAIN` | `acme` 模式允许签发的唯一主机（HostPolicy 白名单） | 空 |
+| `ACME_EMAIL` | `acme` 账户联系邮箱 | 空 |
+| `ACME_CACHE_DIR` | autocert 缓存目录（已签发证书 + 账户密钥） | `/acme` |
+| `ACME_DIRECTORY_URL` | 可选 ACME directory（如 LE staging），用于不烧生产额度地验证签发 | 空（= LE 生产） |
+| `HTTP_ADDR` | TLS 模式下 :80 的 ACME HTTP-01 挑战 + HTTP→HTTPS 跳转绑定 | `:80` |
+| `HTTPS_ADDR` | TLS 模式下 :443 的 HTTPS 绑定 | `:443` |
 | `SLUICE_STORE` | 路由 store：`static` 或 `postgres` | `static` |
 | `DATABASE_URL` | Postgres DSN（`SLUICE_STORE=postgres` 时必填） | 空 |
 | `ROUTES_SEED` | Postgres 播种用的路由配置文件路径（可选，缺省用 `-config` 里的 routes） | 空 |
+
+### TLS 终止与公网暴露
+
+Sluice 是整套 Holdfast 的**唯一公网面**：它在 `id.w33d.xyz` 上终止 TLS 并反代到内网
+Keystone / whoami（后者均不对外发布）。`TLS_MODE` 选择终止方式：
+
+- **`off`（默认，开发）**：在 `LISTEN_ADDR` 上绑定单一明文 HTTP，行为与历史完全一致。
+- **`file`**：从 `TLS_CERT_FILE` / `TLS_KEY_FILE` 加载证书在 `HTTPS_ADDR`（默认 `:443`）服务
+  HTTPS；同时在 `HTTP_ADDR`（默认 `:80`）将一切 301 跳转到 https。迭代期可用自签证书
+  + `/etc/hosts id.w33d.xyz 127.0.0.1` 演练完整 HTTPS 链路。
+- **`acme`**：用 `golang.org/x/crypto/acme/autocert` 自动签发/续期 Let's Encrypt 证书，
+  HostPolicy 白名单锁定 `ACME_DOMAIN`，证书与账户密钥缓存在 `ACME_CACHE_DIR`（`/acme` 卷）；
+  `:80` 由 `autocert` 的 HTTPHandler 服务 ACME HTTP-01 挑战，其余 301 跳转到 https；`:443`
+  使用 `manager.TLSConfig()`。设 `ACME_DIRECTORY_URL` 为 LE staging 可先行验证签发再切生产。
+
+**公网 issuer vs 内网抓取**：`KEYSTONE_ISSUER` 始终是用于校验 `iss` 的**公网**值
+（`https://id.w33d.xyz`），而 `JWKS_FETCH_URL`（或 `OIDC_DISCOVERY_URL`）让 Sluice 从**内网**
+Keystone（`http://keystone:8080`）抓取 JWKS，避免穿过自身 TLS 回环。设了 `JWKS_FETCH_URL`
+即直接拉取该 `jwks_uri` 并跳过 discovery（discovery 文档里的 `jwks_uri` 指向公网，会回环）。
+
+### 前置（front）Keystone 的生产路由表
+
+`config.holdfast.json` 是已就绪的生产路由表：把 Keystone 的公开端点
+（`/.well-known/`、`/authorize`、`/token`、`/jwks.json`、`/userinfo`、`/login`、`/logout`、
+`/account`、`/register`、`/webauthn/`、`/static/`、`/callback`、以及根 `/`）作为**非保护**路由
+反代到 `http://keystone:8080`，把演示用 `/api` 作为**保护**路由（forward-auth）反代到
+`http://whoami:80`。反代时**保留原始 Host 头**并（TLS 终止后）置 `X-Forwarded-Proto=https`，
+使 Keystone 能正确构造绝对 OIDC URL。最长前缀优先保证 `/api` 等更具体前缀压过根 `/`。
+
+```bash
+# 生产（acme）：env 提供 TLS 模式，路由表来自 config.holdfast.json
+docker run -d --name sluice -p 80:80 -p 443:443 -v sluice-acme:/acme \
+  -e TLS_MODE=acme -e ACME_DOMAIN=id.w33d.xyz -e ACME_EMAIL=momoxiaomaster@gmail.com \
+  holdfast/sluice:dev -config /app/config.holdfast.json
+```
 
 ```bash
 # 以 Postgres 作为路由数据源运行（表为空时从配置 routes 幂等播种）
@@ -61,9 +106,12 @@ curl http://127.0.0.1:9090/healthz   # -> ok
 ```
 
 镜像为多阶段构建：`golang` builder 产出 `CGO_ENABLED=0` 静态二进制，运行阶段为
-`scratch` + 非 root（UID 65532）+ `EXPOSE 9090`。`HEALTHCHECK` 复用二进制自带的
-`sluice -healthcheck` 标志探测 `/healthz`（scratch 无 shell/wget），探测地址取自
-`LISTEN_ADDR`（`0.0.0.0` 自动改用回环拨号）。
+`scratch` + 非 root（UID 65532）+ `EXPOSE 80 443 9090` + `VOLUME /acme`（autocert 缓存，
+属主即 65532，证书随重启留存以免触发 LE 额度）。`HEALTHCHECK` 复用二进制自带的
+`sluice -healthcheck` 标志探测 `/healthz`（scratch 无 shell/wget），并按 `TLS_MODE` 选择
+scheme：`off` 走 `LISTEN_ADDR` 的明文 HTTP，`file`/`acme` 走 `HTTPS_ADDR` 的 HTTPS
+（回环拨号，跳过证书校验）。镜像内置 `/app/config.json`（dev 默认）与
+`/app/config.holdfast.json`（生产路由表）。
 
 ## 配置说明
 
@@ -88,7 +136,14 @@ curl http://127.0.0.1:9090/healthz   # -> ok
 
 - `GET /healthz` -> `200 "ok"`。
 - 配置文件驱动的路由匹配（最长前缀优先 + 可选 Host 精确匹配）。
-- 流式反向代理 + `X-Forwarded-*` 注入。
+- 流式反向代理 + `X-Forwarded-*` 注入 + **保留原始 Host 头**（供 Keystone 构造绝对 URL）。
+- **TLS 终止三模式**（`TLS_MODE=off|file|acme`）：`file` 加载证书文件，`acme` 用 autocert 自动
+  签发 LE 证书（HostPolicy 锁定 `ACME_DOMAIN`、缓存 `/acme`、可选 staging directory）；`file`/`acme`
+  均在 `:80` 服务 ACME HTTP-01 挑战并 301 跳转 https，在 `:443` 终止 TLS。`off` 保持历史明文行为。
+- **前置 Keystone**：把 Keystone 公开端点作为非保护路由反代到内网 `http://keystone:8080`，演示
+  `/api` 作为保护路由反代到 `http://whoami:80`（`config.holdfast.json`）。
+- **公网 issuer / 内网抓取分离**：`KEYSTONE_ISSUER` 校验公网 `iss`，`JWKS_FETCH_URL` /
+  `OIDC_DISCOVERY_URL` 从内网 Keystone 抓取 JWKS，避免穿过自身 TLS 回环。
 - 受保护路由的 RS256 forward-auth：OIDC discovery、JWKS 按 `kid` 缓存；校验 `iss` + `exp`，
   固定算法 RS256（抵御 `alg=none` 与 RS->HS 混淆）。
 - **JWKS 按需刷新韧性**：kid-miss 时按缓存健康度决定行为——健康缓存对未知 kid 用**短反应式
@@ -109,7 +164,6 @@ curl http://127.0.0.1:9090/healthz   # -> ok
 
 - **`aud` 校验**：v0 不校验 audience（Sluice 作为资源服务器尚不知道 `client_id`）。预留 seam，
   待可配置期望 audience 后用 `jwt.WithAudience` 开启。详见 `internal/auth/verifier.go`。
-- **TLS**：v0 仅在 loopback 上以明文 HTTP 绑定，仅用于开发。生产需后续 Keyward 驱动的 TLS 终止。
 - **时钟偏移容忍**：默认零 leeway；后续可加 `jwt.WithLeeway`。
 - **FusionDB / CDC 控制面**：路由当前为内存 `StaticStore` 或一次性加载快照的
   `PostgresStore`（均不热加载）。`internal/store/store.go` 标注了 `TODO(fusiondb-seam)`：
@@ -131,7 +185,8 @@ Dockerfile / .dockerignore    多阶段静态构建 -> scratch 非 root 运行�
 internal/auth/verifier.go     基于 golang-jwt 的 RS256/iss/exp 校验
 internal/auth/middleware.go   forward-auth 中间件
 internal/gateway/router.go    路由匹配（Host 精确 + 最长前缀）
-internal/gateway/proxy.go     基于 ReverseProxy 的流式代理（X-Forwarded-* 注入、X-Auth-* 剥离）
+internal/gateway/proxy.go     基于 ReverseProxy 的流式代理（X-Forwarded-* 注入、保留 Host、X-Auth-* 剥离）
+internal/gateway/tls.go       file 模式证书加载、acme autocert.Manager 构建、:80 HTTP→HTTPS 跳转
 internal/gateway/server.go    HTTP handler 组装（healthz、路由分发、鉴权包裹、访问日志）
 internal/accesslog/           slog JSON 访问日志包裹器
 ```

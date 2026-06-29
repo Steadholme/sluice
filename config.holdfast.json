@@ -1,0 +1,25 @@
+{
+  "keystone_issuer": "https://id.w33d.xyz",
+  "jwks_fetch_url": "http://keystone:8080/jwks.json",
+  "acme_domain": "id.w33d.xyz",
+  "acme_email": "momoxiaomaster@gmail.com",
+  "acme_cache_dir": "/acme",
+  "http_addr": ":80",
+  "https_addr": ":443",
+  "routes": [
+    { "name": "ks-well-known", "match": { "path_prefix": "/.well-known/" }, "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-authorize",  "match": { "path_prefix": "/authorize" },   "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-token",      "match": { "path_prefix": "/token" },       "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-jwks",       "match": { "path_prefix": "/jwks.json" },   "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-userinfo",   "match": { "path_prefix": "/userinfo" },    "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-login",      "match": { "path_prefix": "/login" },       "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-logout",     "match": { "path_prefix": "/logout" },      "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-account",    "match": { "path_prefix": "/account" },     "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-register",   "match": { "path_prefix": "/register" },    "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-webauthn",   "match": { "path_prefix": "/webauthn/" },   "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-static",     "match": { "path_prefix": "/static/" },     "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-callback",   "match": { "path_prefix": "/callback" },    "upstream": "http://keystone:8080", "protected": false },
+    { "name": "ks-root",       "match": { "path_prefix": "/" },            "upstream": "http://keystone:8080", "protected": false },
+    { "name": "demo-whoami",   "match": { "path_prefix": "/api" },         "upstream": "http://whoami:80",     "protected": true }
+  ]
+}
