@@ -34,6 +34,36 @@ go run ./cmd/sluice -config config.json
 默认监听 `127.0.0.1:9090`，期望 Keystone issuer 为 `http://127.0.0.1:8080`。
 健康检查：`curl http://127.0.0.1:9090/healthz` 返回 `ok`。
 
+### 环境变量（覆盖 dev 默认，未设置时保持原值）
+
+| 变量 | 作用 | 默认 |
+|------|------|------|
+| `LISTEN_ADDR` | 监听地址（覆盖 `listen_addr`） | `127.0.0.1:9090` |
+| `KEYSTONE_ISSUER` | 期望 OIDC issuer（覆盖 `keystone_issuer`，并重新派生 discovery） | `http://127.0.0.1:8080` |
+| `SLUICE_STORE` | 路由 store：`static` 或 `postgres` | `static` |
+| `DATABASE_URL` | Postgres DSN（`SLUICE_STORE=postgres` 时必填） | 空 |
+| `ROUTES_SEED` | Postgres 播种用的路由配置文件路径（可选，缺省用 `-config` 里的 routes） | 空 |
+
+```bash
+# 以 Postgres 作为路由数据源运行（表为空时从配置 routes 幂等播种）
+export SLUICE_STORE=postgres
+export DATABASE_URL='postgres://postgres:pw@127.0.0.1:5432/sluice'
+go run ./cmd/sluice -config config.json
+```
+
+### 容器运行
+
+```bash
+docker build -t holdfast/sluice:dev .
+docker run -d --name sluice -p 9090:9090 holdfast/sluice:dev
+curl http://127.0.0.1:9090/healthz   # -> ok
+```
+
+镜像为多阶段构建：`golang` builder 产出 `CGO_ENABLED=0` 静态二进制，运行阶段为
+`scratch` + 非 root（UID 65532）+ `EXPOSE 9090`。`HEALTHCHECK` 复用二进制自带的
+`sluice -healthcheck` 标志探测 `/healthz`（scratch 无 shell/wget），探测地址取自
+`LISTEN_ADDR`（`0.0.0.0` 自动改用回环拨号）。
+
 ## 配置说明
 
 ```jsonc
@@ -56,9 +86,16 @@ go run ./cmd/sluice -config config.json
 - `GET /healthz` -> `200 "ok"`。
 - 配置文件驱动的路由匹配（最长前缀优先 + 可选 Host 精确匹配）。
 - 流式反向代理 + `X-Forwarded-*` 注入。
-- 受保护路由的 RS256 forward-auth：OIDC discovery、JWKS 按 `kid` 缓存、未知 `kid` 触发
-  冷却门控的惰性刷新（吸收密钥轮换）；校验 `iss` + `exp`，固定算法 RS256（抵御 `alg=none`
-  与 RS->HS 混淆）。
+- 受保护路由的 RS256 forward-auth：OIDC discovery、JWKS 按 `kid` 缓存；校验 `iss` + `exp`，
+  固定算法 RS256（抵御 `alg=none` 与 RS->HS 混淆）。
+- **JWKS 按需刷新韧性**：kid-miss 时按缓存健康度决定行为——健康缓存（已成功刷新且在
+  `minRefresh` 内）将 miss 视为真未知 kid（轮换/垃圾 kid 护栏），冷/失败缓存则强制刷新且
+  不受成功冷却抑制；并发刷新经 `singleflight` 合并为单次上游抓取；仅对**重复失败**施加有界
+  指数退避，首次重试立即放行——因此 Keystone 启动时不可达不会让 forward-auth 长期卡在 401，
+  恢复后首个请求即放行（见 `internal/auth/jwks_recovery_test.go`）。
+- **可移植 Postgres 路由数据层**（`SLUICE_STORE=postgres`）：`pgx/v5` + 幂等
+  `CREATE TABLE IF NOT EXISTS`，仅用标准 SQL，空表时从配置 routes 幂等播种；默认仍走静态
+  内存 store，现有测试无需数据库。
 - 在每个路由上剥离客户端伪造的 `X-Auth-*` 头，仅由校验通过的中间件注入可信值。
 - 结构化访问日志。
 - 完整端到端契约测试 `test/integration_test.go`（伪 Keystone + echo 上游 + 真实 Sluice）。
@@ -69,19 +106,23 @@ go run ./cmd/sluice -config config.json
   待可配置期望 audience 后用 `jwt.WithAudience` 开启。详见 `internal/auth/verifier.go`。
 - **TLS**：v0 仅在 loopback 上以明文 HTTP 绑定，仅用于开发。生产需后续 Keyward 驱动的 TLS 终止。
 - **时钟偏移容忍**：默认零 leeway；后续可加 `jwt.WithLeeway`。
-- **FusionDB / CDC 控制面**：路由当前为文件加载的内存 `StaticStore`。
-  `internal/store/store.go` 标注了 `TODO(fusiondb-seam)`：未来的 `FusionDBStore` 消费 CDC
-  变更流热加载路由，数据路径只调用 `RouteStore.Routes()`，因此替换只是 `cmd/sluice/main.go`
-  的接线改动，代理 / 鉴权代码零改动。
-- WebSocket / gRPC / HTTP2 推送、负载均衡、单飞 + 退避的 JWKS 刷新等为后续阶段。
+- **FusionDB / CDC 控制面**：路由当前为内存 `StaticStore` 或一次性加载快照的
+  `PostgresStore`（均不热加载）。`internal/store/store.go` 标注了 `TODO(fusiondb-seam)`：
+  未来的 `FusionDBStore` 消费 CDC 变更流热加载路由，数据路径只调用 `RouteStore.Routes()`，
+  因此替换只是 `cmd/sluice/main.go` 的接线改动，代理 / 鉴权代码零改动。Postgres 数据层
+  刻意只用标准 SQL（`TEXT/BOOLEAN`、`PRIMARY KEY/NOT NULL/DEFAULT`、参数化、`ON CONFLICT`），
+  以便后续不改代码即可跑在 FusionDB 的 pgwire 上。
+- WebSocket / gRPC / HTTP2 推送、负载均衡等为后续阶段。
 
 ## 代码结构
 
 ```
-cmd/sluice/main.go            入口：加载配置、构建 store/JWKS/verifier、组装 server、监听
-internal/config/              Config/Route/Match 结构、JSON 加载与校验、discovery URL 派生
-internal/store/               RouteStore 接口 + 内存 StaticStore（标注 FusionDB seam）
-internal/auth/jwks.go         OIDC discovery + JWKS 抓取 + RSA 公钥重建 + kid 缓存
+cmd/sluice/main.go            入口：加载配置、按 SLUICE_STORE 选 store、构建 JWKS/verifier、组装 server；-healthcheck 探针
+internal/config/              Config/Route/Match 结构、JSON 加载与校验、discovery URL 派生、env 覆盖（ApplyEnv）
+internal/store/store.go       RouteStore 接口 + 内存 StaticStore（标注 FusionDB seam）
+internal/store/postgres.go    pgx/v5 PostgresStore：幂等迁移 + 空表播种 + 快照加载（可移植 SQL）
+internal/auth/jwks.go         OIDC discovery + JWKS 抓取 + RSA 公钥重建 + kid 缓存 + singleflight/退避恢复
+Dockerfile / .dockerignore    多阶段静态构建 -> scratch 非 root 运行，-healthcheck 驱动 HEALTHCHECK
 internal/auth/verifier.go     基于 golang-jwt 的 RS256/iss/exp 校验
 internal/auth/middleware.go   forward-auth 中间件
 internal/gateway/router.go    路由匹配（Host 精确 + 最长前缀）

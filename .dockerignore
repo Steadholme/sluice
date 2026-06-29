@@ -1,0 +1,21 @@
+# VCS / CI
+.git
+.gitignore
+
+# Local runtime config (the image bakes config.example.json instead)
+/config.json
+
+# Build artifacts
+/bin/
+/sluice
+*.test
+*.out
+
+# Editor / OS noise
+*.swp
+.DS_Store
+
+# Docs and container metadata are not needed in the build context
+Dockerfile
+.dockerignore
+README.md
