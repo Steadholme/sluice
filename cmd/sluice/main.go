@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/holdfast/sluice/internal/audit"
@@ -92,6 +93,10 @@ func main() {
 	provider, closeProvider := buildProvider(cfg, jwks, internalClient, auditor, log)
 	defer closeProvider()
 
+	// In acme mode the autocert HostPolicy is the live route hosts ∪ the apex ∪ the
+	// legacy ACME_DOMAIN, so we hand serve() the same route store to read from.
+	acmeHosts := gateway.RouteHostSet(routeStore, cfg.ACMEDomain, apexHost(cfg))
+
 	srv := gateway.NewServer(routeStore, gateway.Options{
 		Verifier:  verifier,
 		Provider:  provider,
@@ -108,10 +113,17 @@ func main() {
 		"oidc_sso", provider != nil,
 		"audit", cfg.AuditEnabled,
 	)
-	if err := serve(log, cfg, srv.Handler()); err != nil {
+	if err := serve(log, cfg, srv.Handler(), acmeHosts); err != nil {
 		log.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+// apexHost is the registrable apex implied by the cookie domain (e.g. .w33d.xyz
+// -> w33d.xyz), folded into the autocert allowed-host set so the apex (Portal)
+// can obtain a certificate even before its route row exists.
+func apexHost(cfg *config.Config) string {
+	return strings.TrimPrefix(cfg.CookieDomain, ".")
 }
 
 // serve binds the gateway according to cfg.TLSMode. In off mode it serves a
@@ -119,7 +131,7 @@ func main() {
 // and acme modes it terminates TLS on HTTPSAddr and runs an HTTP server on
 // HTTPAddr that serves the ACME HTTP-01 challenge (acme mode) and 301-redirects
 // everything else to https. It returns the first fatal listener error.
-func serve(log *slog.Logger, cfg *config.Config, handler http.Handler) error {
+func serve(log *slog.Logger, cfg *config.Config, handler http.Handler, acmeHosts gateway.AllowedHosts) error {
 	if cfg.TLSMode == config.TLSModeOff {
 		httpServer := &http.Server{
 			Addr:              cfg.ListenAddr,
@@ -138,12 +150,12 @@ func serve(log *slog.Logger, cfg *config.Config, handler http.Handler) error {
 	var challengeHandler http.Handler
 	switch cfg.TLSMode {
 	case config.TLSModeACME:
-		m := gateway.NewACMEManager(cfg)
+		m := gateway.NewACMEManager(cfg, acmeHosts)
 		tlsConf = m.TLSConfig()
 		// HTTPHandler serves /.well-known/acme-challenge/* and forwards the rest
 		// to the https redirect.
 		challengeHandler = m.HTTPHandler(gateway.RedirectHTTPSHandler())
-		log.Info("acme enabled", "domain", cfg.ACMEDomain, "cache", cfg.ACMECacheDir, "directory", cfg.ACMEDirectoryURL)
+		log.Info("acme enabled", "hosts", acmeHosts(), "cache", cfg.ACMECacheDir, "directory", cfg.ACMEDirectoryURL)
 	case config.TLSModeFile:
 		var err error
 		tlsConf, err = gateway.FileTLSConfig(cfg)
@@ -251,6 +263,7 @@ func buildProvider(cfg *config.Config, jwks *auth.JWKSCache, client *http.Client
 		RedirectURI:   cfg.GWRedirectURI,
 		SessionTTL:    cfg.GWSessionTTL,
 		SessionSecret: cfg.GWSessionSecret,
+		CookieDomain:  cfg.CookieDomain,
 		Auditor:       auditor,
 	}, jwks, client, sessions, states, log)
 	if err != nil {
