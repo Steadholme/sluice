@@ -394,6 +394,40 @@ func TestCookieSignerRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSafeReturnCrossSubdomain covers the post-login redirect target validation:
+// a relative path is kept; an absolute https URL within the cookie domain (apex or
+// any subdomain) is allowed so login returns to the ORIGINAL subdomain; every
+// other absolute target (foreign host, non-https, look-alike domain,
+// protocol-relative) is downgraded to its path so we never emit an open redirect.
+func TestSafeReturnCrossSubdomain(t *testing.T) {
+	p := &Provider{cfg: Config{CookieDomain: ".w33d.xyz"}}
+	cases := []struct{ in, want string }{
+		{"/dashboard?x=1", "/dashboard?x=1"},
+		{"https://vitals.w33d.xyz/dashboard?x=1", "https://vitals.w33d.xyz/dashboard?x=1"},
+		{"https://w33d.xyz/", "https://w33d.xyz/"},
+		{"https://evil.com/phish", "/phish"},
+		{"http://vitals.w33d.xyz/x", "/x"},
+		{"https://notw33d.xyz/x", "/x"},
+		{"//evil.com/x", "/x"},
+		{"", "/"},
+	}
+	for _, tc := range cases {
+		if got := p.safeReturn(tc.in); got != tc.want {
+			t.Errorf("safeReturn(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	// With no cookie domain (host-only cookie) absolute URLs are never trusted and
+	// downgrade to their path; relative paths still pass.
+	hostOnly := &Provider{cfg: Config{CookieDomain: ""}}
+	if got := hostOnly.safeReturn("https://vitals.w33d.xyz/x"); got != "/x" {
+		t.Errorf("host-only safeReturn(absolute) = %q, want /x", got)
+	}
+	if got := hostOnly.safeReturn("/x?y=1"); got != "/x?y=1" {
+		t.Errorf("host-only safeReturn(relative) = %q, want /x?y=1", got)
+	}
+}
+
 // TestMemoryStateSingleUse asserts TakeState is single-use.
 func TestMemoryStateSingleUse(t *testing.T) {
 	m := NewMemoryStore()

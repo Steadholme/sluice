@@ -3,12 +3,18 @@
 // It is the mechanism by which every public base-service UI is gated behind
 // Keystone SSO: a route flagged auth="sso" runs requests through Middleware,
 // which either injects the verified identity (X-Auth-*) from a valid gateway
-// session cookie (__Host-gw) and proxies, or 302-redirects the browser through
+// session cookie (__Secure-gw) and proxies, or 302-redirects the browser through
 // Keystone's PUBLIC /authorize. The authorization-code + PKCE callback is served
 // by Sluice itself at /_gw/auth/callback: it exchanges the code at the INTERNAL
 // token endpoint (optionally over mTLS), validates the id_token (signature via
 // the shared JWKS cache, iss/aud/nonce/exp), creates a session, and returns the
 // browser to where it started.
+//
+// The session cookie is DOMAIN-SCOPED (Domain=COOKIE_DOMAIN, default .w33d.xyz)
+// so a single login covers every *.w33d.xyz subdomain (true cross-subdomain SSO):
+// the callback runs on id.w33d.xyz, sets the domain cookie, and 302s back to the
+// FULL original subdomain URL (e.g. https://vitals.w33d.xyz/...), where the same
+// cookie is then sent.
 //
 // The package is wired only when GW_OIDC=on. With it off, the gateway keeps its
 // pure bearer/public behavior and this code is never reached.
@@ -44,10 +50,18 @@ const (
 	CallbackPath  = "/_gw/auth/callback"
 	LogoutPath    = "/_gw/auth/logout"
 
-	// DefaultCookieName uses the __Host- prefix so the cookie is locked to the
-	// exact host over HTTPS with Path=/ and no Domain — the strongest binding a
-	// browser enforces. It REQUIRES Secure, so SSO presupposes TLS termination.
-	DefaultCookieName = "__Host-gw"
+	// DefaultCookieName uses the __Secure- prefix (NOT __Host-): __Secure- still
+	// REQUIRES Secure + HTTPS but — unlike __Host- — PERMITS a Domain attribute, so
+	// the cookie can be scoped to the parent COOKIE_DOMAIN (.w33d.xyz) for
+	// cross-subdomain SSO. Host-locking is intentionally traded for one session
+	// across every *.w33d.xyz service.
+	DefaultCookieName = "__Secure-gw"
+
+	// DefaultCookieDomain scopes the session cookie to the parent registrable
+	// domain so one gateway login is sent to every subdomain. A leading dot is the
+	// classic "all subdomains" form. An empty CookieDomain (e.g. in unit tests)
+	// keeps the cookie host-only, preserving the pre-subdomain behavior.
+	DefaultCookieDomain = ".w33d.xyz"
 
 	// stateTTL bounds how long an in-flight authorization may take from the
 	// authorize redirect to the callback.
@@ -69,6 +83,7 @@ type Config struct {
 	SessionTTL    time.Duration // gateway session lifetime
 	SessionSecret string        // HMAC key for the signed cookie id
 	CookieName    string        // defaults to DefaultCookieName
+	CookieDomain  string        // Domain attribute for the session cookie (e.g. .w33d.xyz); empty = host-only
 
 	// Auditor is the non-blocking audit emitter. When nil, the relying party
 	// emits no audit events (and behaves exactly as before).
@@ -199,7 +214,7 @@ func (p *Provider) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// sessionIdentity resolves the __Host-gw cookie to a live session identity. Any
+// sessionIdentity resolves the __Secure-gw cookie to a live session identity. Any
 // failure (no cookie, bad signature, unknown/expired session) returns ok=false
 // so the caller starts a fresh login.
 func (p *Provider) sessionIdentity(r *http.Request) (*auth.Identity, bool) {
@@ -255,7 +270,7 @@ func (p *Provider) beginAuth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCallback completes the flow: verify state, exchange the code, validate
-// the id_token, mint a session, set __Host-gw, and return to the original URL.
+// the id_token, mint a session, set __Secure-gw, and return to the original URL.
 func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	if e := qs.Get("error"); e != "" {
@@ -325,7 +340,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		Severity: audit.SeverityInfo,
 	})
 	p.setCookie(w, p.signer.sign(id), int(p.cfg.SessionTTL.Seconds()))
-	http.Redirect(w, r, safeReturn(st.OriginalURL), http.StatusFound)
+	http.Redirect(w, r, p.safeReturn(st.OriginalURL), http.StatusFound)
 }
 
 // handleLogout clears the session (best-effort) and the cookie, then returns the
@@ -439,12 +454,17 @@ func (p *Provider) validateIDToken(ctx context.Context, raw, wantNonce string) (
 	return claims, nil
 }
 
-// setCookie writes (or clears, when maxAge<0) the __Host-gw session cookie.
+// setCookie writes (or clears, when maxAge<0) the __Secure-gw session cookie. The
+// Domain attribute (when CookieDomain is set) scopes it to the parent domain so a
+// single login is presented across every *.w33d.xyz subdomain; an empty
+// CookieDomain leaves it host-only. SameSite=Lax keeps it sent on the top-level
+// navigation that returns from Keystone login.
 func (p *Provider) setCookie(w http.ResponseWriter, value string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     p.cfg.CookieName,
 		Value:    value,
 		Path:     "/",
+		Domain:   p.cfg.CookieDomain,
 		Secure:   true,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
@@ -515,23 +535,72 @@ func pkceChallengeS256(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-// originalURL captures the path+query the browser was trying to reach so the
-// callback can return there. It is always a same-origin relative reference.
+// originalURL captures the ABSOLUTE URL the browser was trying to reach so the
+// callback — which runs on the id.w33d.xyz host — can return the browser to the
+// ORIGINAL subdomain (e.g. https://vitals.w33d.xyz/dashboard). The scheme is
+// derived from the inbound connection (Sluice terminates TLS, so r.TLS is set for
+// real public traffic); a request with no Host degrades to the relative path so
+// the callback returns same-origin.
 func originalURL(r *http.Request) string {
-	u := r.URL.RequestURI()
-	if u == "" {
-		return "/"
+	uri := r.URL.RequestURI()
+	if uri == "" {
+		uri = "/"
 	}
-	return u
+	if r.Host == "" {
+		return uri
+	}
+	scheme := "https"
+	if r.TLS == nil {
+		scheme = "http"
+	}
+	return scheme + "://" + r.Host + uri
 }
 
-// safeReturn ensures the post-login redirect target is a same-origin relative
-// path (defends against an open redirect if the stored value were ever tainted).
-func safeReturn(target string) string {
-	if target == "" || !strings.HasPrefix(target, "/") || strings.HasPrefix(target, "//") {
+// safeReturn validates the post-login redirect target before 302-ing the browser
+// to it. To support cross-subdomain SSO an ABSOLUTE https URL is allowed, but ONLY
+// when its host is within the configured cookie domain (e.g. *.w33d.xyz); any
+// other absolute target (open-redirect attempt, foreign or non-https host) is
+// downgraded to its path on the callback host, never followed to a foreign origin.
+// A same-origin relative path is always safe. An empty/odd target falls back to
+// root.
+func (p *Provider) safeReturn(target string) string {
+	if target == "" {
 		return "/"
 	}
-	return target
+	// Same-origin relative path ("/...", but not the protocol-relative "//host").
+	if strings.HasPrefix(target, "/") && !strings.HasPrefix(target, "//") {
+		return target
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return "/"
+	}
+	if u.Scheme == "https" && u.Host != "" && p.hostInCookieDomain(u.Hostname()) {
+		return target
+	}
+	// Not a trusted absolute target: keep only the (safe) path+query so we never
+	// emit an open redirect to a foreign origin.
+	rel := u.EscapedPath()
+	if rel == "" {
+		return "/"
+	}
+	if u.RawQuery != "" {
+		rel += "?" + u.RawQuery
+	}
+	return rel
+}
+
+// hostInCookieDomain reports whether host is the cookie-domain apex or one of its
+// subdomains. With CookieDomain unset (host-only cookie) nothing qualifies, so
+// safeReturn admits relative paths only — the pre-subdomain behavior.
+func (p *Provider) hostInCookieDomain(host string) bool {
+	d := strings.TrimPrefix(p.cfg.CookieDomain, ".")
+	if d == "" {
+		return false
+	}
+	host = strings.ToLower(host)
+	d = strings.ToLower(d)
+	return host == d || strings.HasSuffix(host, "."+d)
 }
 
 // sanitize trims a provider-supplied error code to a short, safe echo.

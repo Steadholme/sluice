@@ -319,3 +319,155 @@ func TestGatewaySSOEndToEnd(t *testing.T) {
 		}
 	})
 }
+
+// TestGatewaySSOCrossSubdomainCookie proves the cutover to DOMAIN-SCOPED SSO: a
+// login started on vitals.w33d.xyz mints a __Secure-gw cookie scoped to .w33d.xyz,
+// the callback returns the browser to the FULL original subdomain URL, and the
+// SAME cookie is accepted on a DIFFERENT subdomain (audit.w33d.xyz) — one login,
+// every subdomain. Host-based vhost routing selects the per-subdomain upstream.
+func TestGatewaySSOCrossSubdomainCookie(t *testing.T) {
+	accesslog.SetLogger(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	const clientID = "gw-sluice"
+	fo := newFakeOIDC(t, clientID)
+	upstream := newEchoUpstream(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	base := "https://" + ln.Addr().String()
+
+	cfg := &config.Config{
+		KeystoneIssuer: fo.url,
+		JWKSFetchURL:   fo.url + "/jwks.json",
+		Routes: []config.Route{
+			{Name: "vitals", Match: config.Match{Host: "vitals.w33d.xyz", PathPrefix: "/"}, Upstream: upstream.server.URL, Auth: "sso"},
+			{Name: "audit", Match: config.Match{Host: "audit.w33d.xyz", PathPrefix: "/"}, Upstream: upstream.server.URL, Auth: "sso"},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	jwks := auth.NewJWKSCache(cfg.DiscoveryURL, &http.Client{Timeout: 5 * time.Second}, time.Second,
+		auth.WithJWKSURI(cfg.JWKSFetchURL))
+	verifier := auth.NewVerifier(jwks, cfg.KeystoneIssuer)
+
+	provider, err := oidc.NewProvider(oidc.Config{
+		Issuer:        fo.url,
+		TokenURL:      fo.url + "/token",
+		ClientID:      clientID,
+		ClientSecret:  "gw-secret",
+		RedirectURI:   base + oidc.CallbackPath,
+		SessionTTL:    time.Hour,
+		SessionSecret: "cross-sub-secret",
+		CookieDomain:  ".w33d.xyz",
+	}, jwks, &http.Client{Timeout: 5 * time.Second}, oidc.NewMemoryStore(), oidc.NewMemoryStore(), nil)
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+
+	handler := gateway.NewServer(store.NewStaticStore(cfg.Routes),
+		gateway.Options{Verifier: verifier, Provider: provider}).Handler()
+
+	certFile, keyFile, pool := genSelfSigned(t, t.TempDir())
+	tlsCfg, err := gateway.FileTLSConfig(&config.Config{TLSMode: config.TLSModeFile, TLSCertFile: certFile, TLSKeyFile: keyFile})
+	if err != nil {
+		t.Fatalf("FileTLSConfig: %v", err)
+	}
+	srv := &http.Server{Handler: handler, TLSConfig: tlsCfg}
+	go func() { _ = srv.ServeTLS(ln, "", "") }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	// Manual redirect chaining (no cookie jar): a Domain=.w33d.xyz cookie cannot be
+	// stored by a jar keyed on the 127.0.0.1 dial host, so we thread the cookie by
+	// hand and drive each subdomain via an explicit Host header (TLS SNI stays the
+	// dialed 127.0.0.1, which the self-signed cert covers).
+	nc := &http.Client{
+		Timeout:       10 * time.Second,
+		Transport:     &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	// (1) sso route on vitals.w33d.xyz, unauthenticated -> 302 to authorize.
+	req1, _ := http.NewRequest(http.MethodGet, base+"/dashboard?x=1", nil)
+	req1.Host = "vitals.w33d.xyz"
+	resp1, err := nc.Do(req1)
+	if err != nil {
+		t.Fatalf("vitals GET: %v", err)
+	}
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusFound {
+		t.Fatalf("vitals status = %d, want 302", resp1.StatusCode)
+	}
+	authorizeURL := resp1.Header.Get("Location")
+	if !strings.HasPrefix(authorizeURL, fo.url+"/authorize") {
+		t.Fatalf("Location = %q, want authorize redirect", authorizeURL)
+	}
+
+	// (2) follow to the fake Keystone authorize -> 302 back to the callback.
+	resp2, err := nc.Get(authorizeURL)
+	if err != nil {
+		t.Fatalf("authorize GET: %v", err)
+	}
+	resp2.Body.Close()
+	callbackURL := resp2.Header.Get("Location")
+
+	// (3) callback mints the session, sets the DOMAIN cookie, and returns the
+	//     browser to the FULL original vitals URL (cross-subdomain return).
+	resp3, err := nc.Get(callbackURL)
+	if err != nil {
+		t.Fatalf("callback GET: %v", err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusFound {
+		t.Fatalf("callback status = %d, want 302", resp3.StatusCode)
+	}
+	if got := resp3.Header.Get("Location"); got != "https://vitals.w33d.xyz/dashboard?x=1" {
+		t.Errorf("callback returned to %q, want full original subdomain URL https://vitals.w33d.xyz/dashboard?x=1", got)
+	}
+
+	// The session cookie is the domain-scoped __Secure-gw (Domain attr present,
+	// SameSite=Lax, Secure, HttpOnly).
+	var gw *http.Cookie
+	for _, c := range resp3.Cookies() {
+		if c.Name == oidc.DefaultCookieName {
+			gw = c
+		}
+	}
+	if gw == nil {
+		t.Fatalf("no %s cookie set on callback", oidc.DefaultCookieName)
+	}
+	if strings.TrimPrefix(gw.Domain, ".") != "w33d.xyz" {
+		t.Errorf("cookie Domain = %q, want a .w33d.xyz domain scope", gw.Domain)
+	}
+	if gw.SameSite != http.SameSiteLaxMode {
+		t.Errorf("cookie SameSite = %v, want Lax", gw.SameSite)
+	}
+	if !gw.Secure || !gw.HttpOnly {
+		t.Errorf("cookie Secure=%v HttpOnly=%v, want both true", gw.Secure, gw.HttpOnly)
+	}
+
+	// (4) cross-subdomain: present the SAME cookie to a DIFFERENT subdomain
+	//     (audit.w33d.xyz). The session is accepted with NO re-login and the
+	//     verified identity is injected upstream.
+	req4, _ := http.NewRequest(http.MethodGet, base+"/incidents", nil)
+	req4.Host = "audit.w33d.xyz"
+	req4.AddCookie(&http.Cookie{Name: gw.Name, Value: gw.Value})
+	resp4, err := nc.Do(req4)
+	if err != nil {
+		t.Fatalf("audit GET: %v", err)
+	}
+	defer resp4.Body.Close()
+	if resp4.StatusCode != http.StatusOK {
+		t.Fatalf("cross-subdomain status = %d, want 200 (session accepted on another subdomain)", resp4.StatusCode)
+	}
+	h := decodeReflected(t, resp4.Body)
+	if got := first(h["X-Auth-Subject"]); got != "u_admin" {
+		t.Errorf("cross-subdomain X-Auth-Subject = %q, want u_admin", got)
+	}
+	if got := first(h["X-Auth-Email"]); got != "admin@holdfast.local" {
+		t.Errorf("cross-subdomain X-Auth-Email = %q, want admin@holdfast.local", got)
+	}
+}

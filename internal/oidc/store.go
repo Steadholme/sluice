@@ -6,7 +6,7 @@ import (
 )
 
 // Session is a server-side gateway browser session. The opaque ID is carried
-// (signed) in the __Host-gw cookie; the rest is the identity injected upstream
+// (signed) in the __Secure-gw cookie; the rest is the identity injected upstream
 // (sub/email/scope) plus lifecycle timestamps (unix seconds).
 type Session struct {
 	ID        string
