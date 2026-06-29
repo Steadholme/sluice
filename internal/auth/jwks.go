@@ -132,6 +132,20 @@ func WithRotationCooldown(d time.Duration) JWKSOption {
 	}
 }
 
+// WithJWKSURI pre-seeds the jwks_uri so the cache fetches keys DIRECTLY from it
+// and skips OIDC discovery entirely. The binary wires this from JWKS_FETCH_URL
+// to fetch JWKS from the INTERNAL Keystone (e.g. http://keystone:8080/jwks.json)
+// instead of following the discovery document's jwks_uri, which points at the
+// PUBLIC issuer and would otherwise loop back through Sluice's own TLS. An empty
+// value is ignored, leaving normal discovery behaviour.
+func WithJWKSURI(uri string) JWKSOption {
+	return func(c *JWKSCache) {
+		if uri != "" {
+			c.jwksURI = uri
+		}
+	}
+}
+
 // KeyByKID returns the cached public key for kid. On a miss it performs an
 // on-demand refresh (deduped across concurrent callers) and retries once, so a
 // freshly-rotated key or a recovered Keystone is picked up without a fetch

@@ -21,6 +21,15 @@ const (
 	DefaultListenAddr          = "127.0.0.1:9090"
 	DefaultKeystoneIssuer      = "http://127.0.0.1:8080"
 	DefaultJWKSRefreshInterval = 5 * time.Minute
+	// DefaultHTTPAddr / DefaultHTTPSAddr are the bind addresses used only when
+	// TLS is enabled (TLS_MODE=file|acme). :80 serves the ACME HTTP-01 challenge
+	// and HTTP->HTTPS redirect; :443 serves the TLS-terminated gateway. In off
+	// mode neither is used and the gateway binds the single plain ListenAddr.
+	DefaultHTTPAddr  = ":80"
+	DefaultHTTPSAddr = ":443"
+	// DefaultACMECacheDir is the autocert cache directory (issued certs + account
+	// key). It is a Docker VOLUME owned by the non-root runtime user.
+	DefaultACMECacheDir = "/acme"
 	// DefaultJWKSRotationCooldown is the SHORT reactive cooldown after a
 	// successful JWKS refresh during which a healthy cache treats an unknown kid
 	// as a garbage-kid storm; past it an unknown kid is assumed to be a real
@@ -45,6 +54,31 @@ const (
 	// kid-miss refresh cooldown. Accepts a Go duration string (e.g. "5s"); a
 	// malformed value is treated as unset so the default still applies.
 	EnvJWKSRotationCooldown = "JWKS_ROTATION_COOLDOWN"
+
+	// TLS / public-exposure knobs. TLS_MODE selects how Sluice terminates TLS;
+	// the rest configure the file and acme modes and the :80/:443 bind addrs.
+	EnvTLSMode          = "TLS_MODE"           // off | file | acme (default off)
+	EnvTLSCertFile      = "TLS_CERT_FILE"      // file mode: PEM certificate (chain)
+	EnvTLSKeyFile       = "TLS_KEY_FILE"       // file mode: PEM private key
+	EnvACMEDomain       = "ACME_DOMAIN"        // acme mode: the single allowed host (HostPolicy)
+	EnvACMEEmail        = "ACME_EMAIL"         // acme mode: ACME account contact email
+	EnvACMECacheDir     = "ACME_CACHE_DIR"     // acme mode: autocert.DirCache directory
+	EnvACMEDirectoryURL = "ACME_DIRECTORY_URL" // acme mode: optional ACME directory (e.g. LE staging)
+	EnvHTTPAddr         = "HTTP_ADDR"          // tls modes: :80 ACME-challenge + redirect bind
+	EnvHTTPSAddr        = "HTTPS_ADDR"         // tls modes: :443 HTTPS bind
+
+	// Issuer-vs-internal-fetch overrides. KEYSTONE_ISSUER stays the PUBLIC issuer
+	// used for JWT iss validation; these two let Sluice FETCH discovery/JWKS from
+	// the INTERNAL Keystone (e.g. http://keystone:8080) to avoid a TLS loopback.
+	EnvDiscoveryURL = "OIDC_DISCOVERY_URL" // overrides discovery_url (discovery doc fetch URL)
+	EnvJWKSFetchURL = "JWKS_FETCH_URL"     // direct jwks_uri; bypasses discovery entirely
+)
+
+// TLS termination modes selectable via EnvTLSMode.
+const (
+	TLSModeOff  = "off"  // plain HTTP on ListenAddr (dev default; unchanged behavior)
+	TLSModeFile = "file" // HTTPS from TLS_CERT_FILE/TLS_KEY_FILE on HTTPSAddr
+	TLSModeACME = "acme" // HTTPS via Let's Encrypt autocert on HTTPSAddr
 )
 
 // Store kinds selectable via EnvStore.
@@ -86,9 +120,23 @@ type Config struct {
 	ListenAddr           string        `json:"listen_addr"`
 	KeystoneIssuer       string        `json:"keystone_issuer"`
 	DiscoveryURL         string        `json:"discovery_url"`
+	JWKSFetchURL         string        `json:"jwks_fetch_url"`
 	JWKSRefreshInterval  time.Duration `json:"jwks_refresh_interval"`
 	JWKSRotationCooldown time.Duration `json:"jwks_rotation_cooldown"`
-	Routes               []Route       `json:"routes"`
+
+	// TLS termination + public exposure. Defaults keep TLSMode=off so existing
+	// deployments and tests bind a single plain HTTP listener on ListenAddr.
+	TLSMode          string `json:"tls_mode"`
+	TLSCertFile      string `json:"tls_cert_file"`
+	TLSKeyFile       string `json:"tls_key_file"`
+	ACMEDomain       string `json:"acme_domain"`
+	ACMEEmail        string `json:"acme_email"`
+	ACMECacheDir     string `json:"acme_cache_dir"`
+	ACMEDirectoryURL string `json:"acme_directory_url"`
+	HTTPAddr         string `json:"http_addr"`
+	HTTPSAddr        string `json:"https_addr"`
+
+	Routes []Route `json:"routes"`
 }
 
 // parseFile reads and JSON-decodes a configuration file without validating it.
@@ -143,7 +191,17 @@ func (c *Config) ApplyEnv() {
 	if v := os.Getenv(EnvKeystoneIssuer); v != "" {
 		c.KeystoneIssuer = v
 		// Re-derive discovery from the new issuer (Validate does this when empty).
+		// An explicit OIDC_DISCOVERY_URL below still wins because it is applied
+		// after this reset.
 		c.DiscoveryURL = ""
+	}
+	// Issuer-vs-internal-fetch overrides. These point Sluice at the INTERNAL
+	// Keystone for fetching discovery/JWKS without changing the PUBLIC iss above.
+	if v := os.Getenv(EnvDiscoveryURL); v != "" {
+		c.DiscoveryURL = v
+	}
+	if v := os.Getenv(EnvJWKSFetchURL); v != "" {
+		c.JWKSFetchURL = v
 	}
 	if v := os.Getenv(EnvJWKSRotationCooldown); v != "" {
 		// Go duration string (e.g. "5s"); a malformed value is treated as unset so
@@ -151,6 +209,34 @@ func (c *Config) ApplyEnv() {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			c.JWKSRotationCooldown = d
 		}
+	}
+	// TLS / public-exposure overrides.
+	if v := os.Getenv(EnvTLSMode); v != "" {
+		c.TLSMode = v
+	}
+	if v := os.Getenv(EnvTLSCertFile); v != "" {
+		c.TLSCertFile = v
+	}
+	if v := os.Getenv(EnvTLSKeyFile); v != "" {
+		c.TLSKeyFile = v
+	}
+	if v := os.Getenv(EnvACMEDomain); v != "" {
+		c.ACMEDomain = v
+	}
+	if v := os.Getenv(EnvACMEEmail); v != "" {
+		c.ACMEEmail = v
+	}
+	if v := os.Getenv(EnvACMECacheDir); v != "" {
+		c.ACMECacheDir = v
+	}
+	if v := os.Getenv(EnvACMEDirectoryURL); v != "" {
+		c.ACMEDirectoryURL = v
+	}
+	if v := os.Getenv(EnvHTTPAddr); v != "" {
+		c.HTTPAddr = v
+	}
+	if v := os.Getenv(EnvHTTPSAddr); v != "" {
+		c.HTTPSAddr = v
 	}
 }
 
@@ -178,6 +264,10 @@ func (c *Config) Validate() error {
 		c.DiscoveryURL = strings.TrimRight(c.KeystoneIssuer, "/") + discoverySuffix
 	}
 
+	if err := c.validateTLS(); err != nil {
+		return err
+	}
+
 	if len(c.Routes) == 0 {
 		return fmt.Errorf("no routes configured")
 	}
@@ -197,6 +287,42 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("route %q: upstream %q must be an absolute URL", routeName(r, i), r.Upstream)
 		}
 		r.upstreamURL = u
+	}
+	return nil
+}
+
+// validateTLS applies TLS defaults and enforces the per-mode required fields. It
+// is called from Validate after the issuer/discovery wiring. Defaults keep
+// TLSMode=off so an unset configuration binds a single plain HTTP listener and
+// every existing test/deployment is unchanged.
+func (c *Config) validateTLS() error {
+	if c.TLSMode == "" {
+		c.TLSMode = TLSModeOff
+	}
+	c.TLSMode = strings.ToLower(c.TLSMode)
+	if c.HTTPAddr == "" {
+		c.HTTPAddr = DefaultHTTPAddr
+	}
+	if c.HTTPSAddr == "" {
+		c.HTTPSAddr = DefaultHTTPSAddr
+	}
+	if c.ACMECacheDir == "" {
+		c.ACMECacheDir = DefaultACMECacheDir
+	}
+
+	switch c.TLSMode {
+	case TLSModeOff:
+		// Plain HTTP on ListenAddr; nothing else required.
+	case TLSModeFile:
+		if c.TLSCertFile == "" || c.TLSKeyFile == "" {
+			return fmt.Errorf("tls_mode=file requires tls_cert_file and tls_key_file")
+		}
+	case TLSModeACME:
+		if c.ACMEDomain == "" {
+			return fmt.Errorf("tls_mode=acme requires acme_domain")
+		}
+	default:
+		return fmt.Errorf("invalid tls_mode %q (want %s|%s|%s)", c.TLSMode, TLSModeOff, TLSModeFile, TLSModeACME)
 	}
 	return nil
 }
