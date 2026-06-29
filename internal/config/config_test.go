@@ -3,6 +3,7 @@ package config
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // minimalValid returns a config with one route so Validate's route checks pass,
@@ -183,6 +184,109 @@ func TestLoadExampleConfig(t *testing.T) {
 	}
 	if pub != 1 || prot != 1 {
 		t.Errorf("want 1 public + 1 protected, got %d public / %d protected", pub, prot)
+	}
+}
+
+// Route.Auth normalisation: empty derives from Protected; explicit values are
+// validated and re-sync Protected; an unknown mode is rejected.
+func TestRouteAuthModeNormalization(t *testing.T) {
+	cases := []struct {
+		name          string
+		in            Route
+		wantAuth      string
+		wantProtected bool
+	}{
+		{"empty+unprotected->public", Route{Name: "a", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1"}, AuthPublic, false},
+		{"empty+protected->bearer", Route{Name: "b", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Protected: true}, AuthBearer, true},
+		{"explicit public", Route{Name: "c", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "public", Protected: true}, AuthPublic, false},
+		{"explicit bearer", Route{Name: "d", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "BEARER"}, AuthBearer, true},
+		{"explicit sso syncs protected", Route{Name: "e", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "sso"}, AuthSSO, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{KeystoneIssuer: "http://127.0.0.1:8080", Routes: []Route{tc.in}}
+			if err := c.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			got := c.Routes[0]
+			if got.Auth != tc.wantAuth {
+				t.Errorf("Auth = %q, want %q", got.Auth, tc.wantAuth)
+			}
+			if got.Protected != tc.wantProtected {
+				t.Errorf("Protected = %v, want %v", got.Protected, tc.wantProtected)
+			}
+		})
+	}
+}
+
+func TestRouteAuthModeRejectsUnknown(t *testing.T) {
+	c := &Config{
+		KeystoneIssuer: "http://127.0.0.1:8080",
+		Routes:         []Route{{Name: "bad", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "magic"}},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for unknown auth mode")
+	}
+}
+
+// OIDC SSO + internal-mTLS env overrides apply, default the public issuer to the
+// keystone issuer, and never hard-fail Validate (safe-degrade is done in main).
+func TestApplyEnvGatewayOIDCAndMTLS(t *testing.T) {
+	t.Setenv(EnvKeystoneIssuer, "https://id.w33d.xyz")
+	t.Setenv(EnvGWOIDC, "on")
+	t.Setenv(EnvGWClientID, "gw-sluice")
+	t.Setenv(EnvGWClientSecret, "s3cret")
+	t.Setenv(EnvGWRedirectURI, "https://id.w33d.xyz/_gw/auth/callback")
+	t.Setenv(EnvGWTokenURL, "https://keystone:8443/token")
+	t.Setenv(EnvGWSessionTTL, "2h")
+	t.Setenv(EnvGWSessionSecret, "cookie-key")
+	t.Setenv(EnvInternalMTLS, "on")
+	t.Setenv(EnvKeystoneMTLSCert, "/certs/sluice.crt")
+	t.Setenv(EnvKeystoneMTLSKey, "/certs/sluice.key")
+	t.Setenv(EnvKeystoneMTLSCA, "/certs/root.crt")
+	t.Setenv(EnvKeystoneTLSServerName, "keystone")
+
+	c := minimalValid()
+	c.ApplyEnv()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !c.GWOIDCEnabled {
+		t.Error("GWOIDCEnabled = false, want true")
+	}
+	if c.OIDCIssuer != "https://id.w33d.xyz" {
+		t.Errorf("OIDCIssuer = %q, want public issuer (defaulted from KEYSTONE_ISSUER)", c.OIDCIssuer)
+	}
+	if c.GWClientID != "gw-sluice" || c.GWClientSecret != "s3cret" {
+		t.Errorf("client creds not applied: %q %q", c.GWClientID, c.GWClientSecret)
+	}
+	if c.GWRedirectURI != "https://id.w33d.xyz/_gw/auth/callback" || c.GWTokenURL != "https://keystone:8443/token" {
+		t.Errorf("gw urls not applied: %q %q", c.GWRedirectURI, c.GWTokenURL)
+	}
+	if c.GWSessionTTL != 2*time.Hour {
+		t.Errorf("GWSessionTTL = %v, want 2h", c.GWSessionTTL)
+	}
+	if !c.InternalMTLS || c.KeystoneMTLSCert != "/certs/sluice.crt" || c.KeystoneTLSServerName != "keystone" {
+		t.Errorf("mtls knobs not applied: %+v", c)
+	}
+}
+
+func TestGatewayDefaults(t *testing.T) {
+	c := minimalValid()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if c.OIDCIssuer != c.KeystoneIssuer {
+		t.Errorf("OIDCIssuer = %q, want default = KeystoneIssuer %q", c.OIDCIssuer, c.KeystoneIssuer)
+	}
+	if c.GWSessionTTL != DefaultGWSessionTTL {
+		t.Errorf("GWSessionTTL = %v, want %v", c.GWSessionTTL, DefaultGWSessionTTL)
+	}
+	if c.KeystoneTLSServerName != "keystone" {
+		t.Errorf("KeystoneTLSServerName = %q, want keystone", c.KeystoneTLSServerName)
+	}
+	if c.GWOIDCEnabled || c.InternalMTLS {
+		t.Error("OIDC/mTLS must default OFF")
 	}
 }
 

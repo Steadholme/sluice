@@ -87,6 +87,38 @@ const (
 	StorePostgres = "postgres"
 )
 
+// Per-route authentication modes (Route.Auth). They generalise the legacy
+// boolean Protected: "public" == not protected, "bearer" == the existing
+// forward-auth (Authorization: Bearer RS256 JWT) API path, and "sso" == the new
+// OIDC BROWSER SSO path (gateway session cookie, redirect to Keystone login).
+const (
+	AuthPublic = "public"
+	AuthBearer = "bearer"
+	AuthSSO    = "sso"
+)
+
+// OIDC browser-SSO + internal-mTLS environment variables. All are off by default
+// so an unset deployment keeps the pure bearer/public, plain-http behavior.
+const (
+	EnvGWOIDC          = "GW_OIDC"           // on|off — enable the OIDC browser-SSO relying party
+	EnvOIDCIssuer      = "OIDC_ISSUER"       // PUBLIC issuer for the authorize redirect + id_token iss/aud (default = KEYSTONE_ISSUER)
+	EnvGWClientID      = "GW_CLIENT_ID"      // gateway OIDC client_id registered in Keystone
+	EnvGWClientSecret  = "GW_CLIENT_SECRET"  // gateway client secret (client_secret_post at the token endpoint)
+	EnvGWRedirectURI   = "GW_REDIRECT_URI"   // PUBLIC redirect_uri, e.g. https://id.w33d.xyz/_gw/auth/callback
+	EnvGWTokenURL      = "GW_TOKEN_URL"      // INTERNAL token endpoint (mTLS), e.g. https://keystone:8443/token
+	EnvGWSessionTTL    = "GW_SESSION_TTL"    // gateway session lifetime (Go duration; default 8h)
+	EnvGWSessionSecret = "GW_SESSION_SECRET" // HMAC key signing the opaque __Host-gw cookie id
+
+	EnvInternalMTLS          = "INTERNAL_MTLS"           // on|off — mTLS for the internal Keystone hop
+	EnvKeystoneMTLSCert      = "KEYSTONE_MTLS_CERT"      // client cert PEM (Keyward CN=sluice)
+	EnvKeystoneMTLSKey       = "KEYSTONE_MTLS_KEY"       // client key PEM
+	EnvKeystoneMTLSCA        = "KEYSTONE_MTLS_CA"        // trust anchor PEM (Keyward root)
+	EnvKeystoneTLSServerName = "KEYSTONE_TLS_SERVERNAME" // pinned server name (default "keystone")
+)
+
+// DefaultGWSessionTTL is the gateway browser-session lifetime when unset.
+const DefaultGWSessionTTL = 8 * time.Hour
+
 // Match describes how an incoming request is matched to a Route.
 //
 // Host is optional: when set it must equal the request Host exactly. PathPrefix
@@ -104,6 +136,13 @@ type Route struct {
 	Match     Match  `json:"match"`
 	Upstream  string `json:"upstream"`
 	Protected bool   `json:"protected"`
+
+	// Auth is the per-route authentication mode: "public" | "bearer" | "sso".
+	// It is optional and normalised by Validate: an empty value is derived from
+	// the legacy Protected boolean (true -> "bearer", false -> "public"), so
+	// existing configs and route rows keep their exact behavior. Protected is in
+	// turn re-synced to (Auth != "public") for any legacy reader.
+	Auth string `json:"auth,omitempty"`
 
 	// upstreamURL is the parsed form of Upstream, populated by Validate so the
 	// data path never re-parses on the hot path. Unexported so it is not part
@@ -135,6 +174,28 @@ type Config struct {
 	ACMEDirectoryURL string `json:"acme_directory_url"`
 	HTTPAddr         string `json:"http_addr"`
 	HTTPSAddr        string `json:"https_addr"`
+
+	// OIDC browser-SSO relying party. Off by default (GWOIDCEnabled=false) so the
+	// gateway stays a pure bearer/public forward-auth. When enabled, sso routes
+	// gate the BROWSER through Keystone's login; the token/JWKS calls go INTERNAL
+	// (optionally over mTLS) while the user-facing authorize redirect uses the
+	// PUBLIC OIDCIssuer.
+	GWOIDCEnabled   bool          `json:"gw_oidc_enabled"`
+	OIDCIssuer      string        `json:"oidc_issuer"`
+	GWClientID      string        `json:"gw_client_id"`
+	GWClientSecret  string        `json:"gw_client_secret"`
+	GWRedirectURI   string        `json:"gw_redirect_uri"`
+	GWTokenURL      string        `json:"gw_token_url"`
+	GWSessionTTL    time.Duration `json:"gw_session_ttl"`
+	GWSessionSecret string        `json:"gw_session_secret"`
+
+	// Internal mTLS to Keystone. Off by default; when on, the gateway presents a
+	// Keyward client cert on the internal hop (proxy upstream + token/JWKS).
+	InternalMTLS          bool   `json:"internal_mtls"`
+	KeystoneMTLSCert      string `json:"keystone_mtls_cert"`
+	KeystoneMTLSKey       string `json:"keystone_mtls_key"`
+	KeystoneMTLSCA        string `json:"keystone_mtls_ca"`
+	KeystoneTLSServerName string `json:"keystone_tls_servername"`
 
 	Routes []Route `json:"routes"`
 }
@@ -238,6 +299,62 @@ func (c *Config) ApplyEnv() {
 	if v := os.Getenv(EnvHTTPSAddr); v != "" {
 		c.HTTPSAddr = v
 	}
+
+	// OIDC browser-SSO overrides.
+	if v := os.Getenv(EnvGWOIDC); v != "" {
+		c.GWOIDCEnabled = envOn(v)
+	}
+	if v := os.Getenv(EnvOIDCIssuer); v != "" {
+		c.OIDCIssuer = v
+	}
+	if v := os.Getenv(EnvGWClientID); v != "" {
+		c.GWClientID = v
+	}
+	if v := os.Getenv(EnvGWClientSecret); v != "" {
+		c.GWClientSecret = v
+	}
+	if v := os.Getenv(EnvGWRedirectURI); v != "" {
+		c.GWRedirectURI = v
+	}
+	if v := os.Getenv(EnvGWTokenURL); v != "" {
+		c.GWTokenURL = v
+	}
+	if v := os.Getenv(EnvGWSessionTTL); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			c.GWSessionTTL = d
+		}
+	}
+	if v := os.Getenv(EnvGWSessionSecret); v != "" {
+		c.GWSessionSecret = v
+	}
+
+	// Internal mTLS overrides.
+	if v := os.Getenv(EnvInternalMTLS); v != "" {
+		c.InternalMTLS = envOn(v)
+	}
+	if v := os.Getenv(EnvKeystoneMTLSCert); v != "" {
+		c.KeystoneMTLSCert = v
+	}
+	if v := os.Getenv(EnvKeystoneMTLSKey); v != "" {
+		c.KeystoneMTLSKey = v
+	}
+	if v := os.Getenv(EnvKeystoneMTLSCA); v != "" {
+		c.KeystoneMTLSCA = v
+	}
+	if v := os.Getenv(EnvKeystoneTLSServerName); v != "" {
+		c.KeystoneTLSServerName = v
+	}
+}
+
+// envOn parses a boolean-ish toggle. "on", "true", "1", "yes" (any case) enable;
+// everything else (incl. "off") disables, so a typo fails safe to off.
+func envOn(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "on", "true", "1", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 // Validate applies defaults, parses upstream URLs, derives the discovery URL,
@@ -267,6 +384,7 @@ func (c *Config) Validate() error {
 	if err := c.validateTLS(); err != nil {
 		return err
 	}
+	c.applyGatewayDefaults()
 
 	if len(c.Routes) == 0 {
 		return fmt.Errorf("no routes configured")
@@ -287,7 +405,33 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("route %q: upstream %q must be an absolute URL", routeName(r, i), r.Upstream)
 		}
 		r.upstreamURL = u
+
+		if err := normalizeAuth(r); err != nil {
+			return fmt.Errorf("route %q: %w", routeName(r, i), err)
+		}
 	}
+	return nil
+}
+
+// normalizeAuth resolves a route's effective auth mode. An empty Auth is derived
+// from the legacy Protected boolean so existing configs/rows are unchanged; an
+// explicit Auth is validated against the known modes. Protected is then re-synced
+// to (Auth != public) so any legacy consumer of the boolean stays correct.
+func normalizeAuth(r *Route) error {
+	r.Auth = strings.ToLower(strings.TrimSpace(r.Auth))
+	if r.Auth == "" {
+		if r.Protected {
+			r.Auth = AuthBearer
+		} else {
+			r.Auth = AuthPublic
+		}
+	}
+	switch r.Auth {
+	case AuthPublic, AuthBearer, AuthSSO:
+	default:
+		return fmt.Errorf("invalid auth %q (want %s|%s|%s)", r.Auth, AuthPublic, AuthBearer, AuthSSO)
+	}
+	r.Protected = r.Auth != AuthPublic
 	return nil
 }
 
@@ -325,6 +469,24 @@ func (c *Config) validateTLS() error {
 		return fmt.Errorf("invalid tls_mode %q (want %s|%s|%s)", c.TLSMode, TLSModeOff, TLSModeFile, TLSModeACME)
 	}
 	return nil
+}
+
+// applyGatewayDefaults fills in OIDC/mTLS defaults. It deliberately does NOT
+// hard-fail on an incomplete OIDC/mTLS configuration: the relying-party and the
+// mTLS transport are built best-effort in main so a misconfiguration degrades to
+// the unchanged bearer/public + plain-http behavior instead of taking the whole
+// gateway down. The PUBLIC OIDC issuer defaults to KeystoneIssuer so the
+// authorize redirect and the id_token iss/aud validation share one source.
+func (c *Config) applyGatewayDefaults() {
+	if c.OIDCIssuer == "" {
+		c.OIDCIssuer = c.KeystoneIssuer
+	}
+	if c.GWSessionTTL <= 0 {
+		c.GWSessionTTL = DefaultGWSessionTTL
+	}
+	if c.KeystoneTLSServerName == "" {
+		c.KeystoneTLSServerName = "keystone"
+	}
 }
 
 func routeName(r *Route, i int) string {

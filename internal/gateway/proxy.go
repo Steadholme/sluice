@@ -47,6 +47,9 @@ func newReverseProxy(route config.Route) *httputil.ReverseProxy {
 			if id, ok := auth.IdentityFromContext(pr.In.Context()); ok {
 				pr.Out.Header.Set(auth.HeaderAuthSubject, id.Subject)
 				pr.Out.Header.Set(auth.HeaderAuthScope, id.Scope)
+				if id.Email != "" {
+					pr.Out.Header.Set(auth.HeaderAuthEmail, id.Email)
+				}
 			}
 		},
 	}

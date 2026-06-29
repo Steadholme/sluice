@@ -17,19 +17,31 @@ const identityKey contextKey = iota
 const (
 	HeaderAuthSubject = "X-Auth-Subject"
 	HeaderAuthScope   = "X-Auth-Scope"
+	HeaderAuthEmail   = "X-Auth-Email"
 )
 
-// Identity is the verified caller identity established by Middleware and read
-// back by the proxy (to inject X-Auth-* upstream) and the access log.
+// Identity is the verified caller identity established by the bearer Middleware
+// or the OIDC SSO middleware and read back by the proxy (to inject X-Auth-*
+// upstream) and the access log. Email is populated on the SSO path (from the
+// id_token) and is empty on the bearer path, whose access token carries no email.
 type Identity struct {
 	Subject string
+	Email   string
 	Scope   string
 }
 
-// IdentityFromContext returns the verified Identity stored by Middleware.
+// IdentityFromContext returns the verified Identity stored on the request.
 func IdentityFromContext(ctx context.Context) (*Identity, bool) {
 	id, ok := ctx.Value(identityKey).(*Identity)
 	return id, ok
+}
+
+// ContextWithIdentity returns a child context carrying the verified Identity.
+// It is the single sanctioned writer of the identity the proxy trusts, shared by
+// the bearer Middleware and the OIDC SSO middleware so both feed the proxy's
+// X-Auth-* injection through one private key.
+func ContextWithIdentity(ctx context.Context, id *Identity) context.Context {
+	return context.WithValue(ctx, identityKey, id)
 }
 
 // SubjectFromContext returns the authenticated subject, or "" if the request
@@ -67,7 +79,7 @@ func Middleware(v *Verifier, next http.Handler) http.Handler {
 		// record installed by the outer accesslog.Wrap handler).
 		accesslog.SetSubject(r.Context(), claims.Subject)
 
-		ctx := context.WithValue(r.Context(), identityKey, id)
+		ctx := ContextWithIdentity(r.Context(), id)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
