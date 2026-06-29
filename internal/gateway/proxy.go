@@ -19,7 +19,12 @@ const authHeaderPrefix = "X-Auth-"
 // The Rewrite hook (Go 1.20+) runs on a clone of the inbound request and:
 //   - routes it to the route's upstream (preserving method, body, headers, and
 //     forwarding the full request path);
-//   - sets X-Forwarded-For / X-Forwarded-Host / X-Forwarded-Proto;
+//   - sets X-Forwarded-For / X-Forwarded-Host / X-Forwarded-Proto (the latter
+//     becomes "https" automatically once Sluice terminates TLS, since the inbound
+//     request then carries a TLS connection state);
+//   - PRESERVES the inbound Host header toward the upstream (instead of rewriting
+//     it to the upstream's host) so a fronted Keystone sees the public host
+//     (id.w33d.xyz) and builds correct absolute OIDC URLs;
 //   - strips every client-supplied X-Auth-* header, then injects the verified
 //     X-Auth-Subject / X-Auth-Scope from the auth context when present.
 //
@@ -31,6 +36,12 @@ func newReverseProxy(route config.Route) *httputil.ReverseProxy {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.SetXForwarded()
+			// SetURL clears Out.Host (so it would default to the upstream host);
+			// re-pin it to the original inbound Host so the upstream — notably a
+			// fronted Keystone — sees the public host and builds correct absolute
+			// URLs. X-Forwarded-Host still carries the same value for apps that
+			// prefer it.
+			pr.Out.Host = pr.In.Host
 
 			stripAuthHeaders(pr.Out.Header)
 			if id, ok := auth.IdentityFromContext(pr.In.Context()); ok {
