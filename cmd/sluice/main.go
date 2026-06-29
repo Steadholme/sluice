@@ -44,7 +44,8 @@ func main() {
 	// Build the JWKS cache + verifier from the Keystone issuer. Warm the cache
 	// best-effort; a failure here is non-fatal because the verifier refreshes
 	// lazily on first protected request and recovers as soon as Keystone is up.
-	jwks := auth.NewJWKSCache(cfg.DiscoveryURL, &http.Client{Timeout: 10 * time.Second}, cfg.JWKSRefreshInterval)
+	jwks := auth.NewJWKSCache(cfg.DiscoveryURL, &http.Client{Timeout: 10 * time.Second}, cfg.JWKSRefreshInterval,
+		auth.WithRotationCooldown(cfg.JWKSRotationCooldown))
 	warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := jwks.Warm(warmCtx); err != nil {
 		log.Warn("jwks warm-up failed; will retry lazily", "error", err)

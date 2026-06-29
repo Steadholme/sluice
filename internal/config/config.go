@@ -21,6 +21,12 @@ const (
 	DefaultListenAddr          = "127.0.0.1:9090"
 	DefaultKeystoneIssuer      = "http://127.0.0.1:8080"
 	DefaultJWKSRefreshInterval = 5 * time.Minute
+	// DefaultJWKSRotationCooldown is the SHORT reactive cooldown after a
+	// successful JWKS refresh during which a healthy cache treats an unknown kid
+	// as a garbage-kid storm; past it an unknown kid is assumed to be a real
+	// signing-key rotation and refetched. Decoupled from (and much shorter than)
+	// JWKSRefreshInterval so a rotated Keystone kid is picked up within seconds.
+	DefaultJWKSRotationCooldown = 5 * time.Second
 	// discoverySuffix is appended to the issuer to derive the OIDC discovery
 	// document URL when DiscoveryURL is not explicitly configured.
 	discoverySuffix = "/.well-known/openid-configuration"
@@ -35,6 +41,10 @@ const (
 	EnvStore          = "SLUICE_STORE"    // route store kind: static|postgres (default static)
 	EnvDatabaseURL    = "DATABASE_URL"    // postgres DSN (postgres store)
 	EnvRoutesSeed     = "ROUTES_SEED"     // path to a routes seed config (postgres store)
+	// EnvJWKSRotationCooldown overrides jwks_rotation_cooldown, the SHORT reactive
+	// kid-miss refresh cooldown. Accepts a Go duration string (e.g. "5s"); a
+	// malformed value is treated as unset so the default still applies.
+	EnvJWKSRotationCooldown = "JWKS_ROTATION_COOLDOWN"
 )
 
 // Store kinds selectable via EnvStore.
@@ -73,11 +83,12 @@ func (r *Route) UpstreamURL() *url.URL { return r.upstreamURL }
 
 // Config is the top-level Sluice configuration.
 type Config struct {
-	ListenAddr          string        `json:"listen_addr"`
-	KeystoneIssuer      string        `json:"keystone_issuer"`
-	DiscoveryURL        string        `json:"discovery_url"`
-	JWKSRefreshInterval time.Duration `json:"jwks_refresh_interval"`
-	Routes              []Route       `json:"routes"`
+	ListenAddr           string        `json:"listen_addr"`
+	KeystoneIssuer       string        `json:"keystone_issuer"`
+	DiscoveryURL         string        `json:"discovery_url"`
+	JWKSRefreshInterval  time.Duration `json:"jwks_refresh_interval"`
+	JWKSRotationCooldown time.Duration `json:"jwks_rotation_cooldown"`
+	Routes               []Route       `json:"routes"`
 }
 
 // parseFile reads and JSON-decodes a configuration file without validating it.
@@ -134,6 +145,13 @@ func (c *Config) ApplyEnv() {
 		// Re-derive discovery from the new issuer (Validate does this when empty).
 		c.DiscoveryURL = ""
 	}
+	if v := os.Getenv(EnvJWKSRotationCooldown); v != "" {
+		// Go duration string (e.g. "5s"); a malformed value is treated as unset so
+		// Validate applies DefaultJWKSRotationCooldown.
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			c.JWKSRotationCooldown = d
+		}
+	}
 }
 
 // Validate applies defaults, parses upstream URLs, derives the discovery URL,
@@ -148,6 +166,9 @@ func (c *Config) Validate() error {
 	}
 	if c.JWKSRefreshInterval <= 0 {
 		c.JWKSRefreshInterval = DefaultJWKSRefreshInterval
+	}
+	if c.JWKSRotationCooldown <= 0 {
+		c.JWKSRotationCooldown = DefaultJWKSRotationCooldown
 	}
 	if _, err := url.Parse(c.KeystoneIssuer); err != nil {
 		return fmt.Errorf("invalid keystone_issuer %q: %w", c.KeystoneIssuer, err)

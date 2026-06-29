@@ -42,6 +42,14 @@ type discoveryDocument struct {
 const (
 	defaultBaseBackoff = 1 * time.Second
 	defaultMaxBackoff  = 30 * time.Second
+
+	// defaultRotationCooldown is the SHORT reactive cooldown applied after a
+	// SUCCESSFUL refresh: within it a healthy cache treats an unknown kid as a
+	// garbage-kid storm and suppresses the on-demand refetch; past it an unknown
+	// kid is assumed to be a real signing-key rotation and IS refetched. It is
+	// deliberately decoupled from (and much shorter than) minRefresh so a rotated
+	// Keystone kid is picked up within seconds, not after the proactive interval.
+	defaultRotationCooldown = 5 * time.Second
 )
 
 // JWKSCache discovers and caches Keystone's RS256 public keys.
@@ -49,10 +57,12 @@ const (
 // Keys are indexed by kid behind an RWMutex. A kid miss triggers an on-demand
 // refresh whose behaviour depends on cache health:
 //
-//   - Healthy cache (keys present, last refresh succeeded recently): a miss is
-//     treated as a genuinely-unknown kid and refreshes are suppressed for
-//     minRefresh after the last SUCCESS. This is the key-rotation / garbage-kid
-//     storm guard — it never blocks recovery because a healthy cache by
+//   - Healthy cache (keys present, last refresh succeeded recently): a miss
+//     within the SHORT rotationCooldown of the last SUCCESS is treated as a
+//     garbage-kid storm and refreshes are suppressed; past that cooldown the miss
+//     is assumed to be a real signing-key rotation and IS refetched. This
+//     reactive cooldown is decoupled from minRefresh, so a rotated kid is picked
+//     up within seconds. It never blocks recovery because a healthy cache by
 //     definition already succeeded.
 //   - Cold or failing cache (no keys, or the last attempt failed): the miss is a
 //     recovery scenario. Refresh is NOT suppressed by the success cooldown; only
@@ -62,41 +72,63 @@ const (
 // Concurrent refreshes are collapsed into one in-flight fetch via singleflight,
 // so a burst of misses (e.g. a token replay storm) costs a single upstream call.
 type JWKSCache struct {
-	discoveryURL string
-	httpClient   *http.Client
-	minRefresh   time.Duration
-	baseBackoff  time.Duration
-	maxBackoff   time.Duration
+	discoveryURL     string
+	httpClient       *http.Client
+	minRefresh       time.Duration // proactive/normal refresh interval (reserved for scheduled refresh)
+	rotationCooldown time.Duration // SHORT reactive cooldown gating a kid-miss refetch on a healthy cache
+	baseBackoff      time.Duration
+	maxBackoff       time.Duration
 
 	sf singleflight.Group
 
 	mu          sync.RWMutex
 	jwksURI     string
 	keys        map[string]*rsa.PublicKey
-	lastSuccess time.Time // time of the last SUCCESSFUL refresh (drives minRefresh)
+	lastSuccess time.Time // time of the last SUCCESSFUL refresh (drives rotationCooldown)
 	lastAttempt time.Time // time of the last refresh attempt (drives failure backoff)
 	failures    int       // consecutive failures since the last success
 	lastErr     error     // last refresh error, returned while backing off
 }
 
 // NewJWKSCache constructs a cache that discovers jwks_uri from discoveryURL.
-// minRefresh is the cooldown after a SUCCESSFUL refresh during which a still
-// missing kid is treated as genuinely unknown (rotation guard), not as a reason
-// to refetch.
-func NewJWKSCache(discoveryURL string, client *http.Client, minRefresh time.Duration) *JWKSCache {
+// minRefresh is the proactive/normal refresh interval. The reactive kid-miss
+// cooldown (the rotation-pickup vs. garbage-kid storm guard) defaults to
+// defaultRotationCooldown and is overridable via WithRotationCooldown.
+func NewJWKSCache(discoveryURL string, client *http.Client, minRefresh time.Duration, opts ...JWKSOption) *JWKSCache {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	if minRefresh <= 0 {
 		minRefresh = 30 * time.Second
 	}
-	return &JWKSCache{
-		discoveryURL: discoveryURL,
-		httpClient:   client,
-		minRefresh:   minRefresh,
-		baseBackoff:  defaultBaseBackoff,
-		maxBackoff:   defaultMaxBackoff,
-		keys:         make(map[string]*rsa.PublicKey),
+	c := &JWKSCache{
+		discoveryURL:     discoveryURL,
+		httpClient:       client,
+		minRefresh:       minRefresh,
+		rotationCooldown: defaultRotationCooldown,
+		baseBackoff:      defaultBaseBackoff,
+		maxBackoff:       defaultMaxBackoff,
+		keys:             make(map[string]*rsa.PublicKey),
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// JWKSOption configures optional JWKSCache behaviour at construction time.
+type JWKSOption func(*JWKSCache)
+
+// WithRotationCooldown overrides the SHORT reactive cooldown that gates an
+// on-demand refresh when a HEALTHY cache sees an unknown kid. A non-positive
+// value is ignored, leaving the default. This is the knob the binary wires from
+// JWKS_ROTATION_COOLDOWN so operators can tune rotation-pickup latency against
+// the garbage-kid storm guard without touching the longer minRefresh interval.
+func WithRotationCooldown(d time.Duration) JWKSOption {
+	return func(c *JWKSCache) {
+		if d > 0 {
+			c.rotationCooldown = d
+		}
 	}
 }
 
@@ -137,11 +169,14 @@ func (c *JWKSCache) doRefresh(ctx context.Context) error {
 	c.mu.Lock()
 	healthy := len(c.keys) > 0 && c.failures == 0 && !c.lastSuccess.IsZero()
 	if healthy {
-		// Rotation / garbage-kid storm guard: a healthy cache that refreshed
-		// successfully within minRefresh treats a missing kid as genuinely
-		// unknown and does not refetch. This can never block recovery because a
-		// healthy cache has, by definition, already recovered.
-		if time.Since(c.lastSuccess) < c.minRefresh {
+		// Reactive kid-miss handling on a healthy cache: within the SHORT
+		// rotationCooldown of the last SUCCESS a missing kid is treated as a
+		// garbage-kid storm and NOT refetched; past that cooldown it is assumed to
+		// be a real signing-key rotation and IS refetched (singleflighted), so a
+		// rotated Keystone kid is picked up within seconds rather than after the
+		// long minRefresh interval. This never blocks recovery because a healthy
+		// cache has, by definition, already recovered.
+		if time.Since(c.lastSuccess) < c.rotationCooldown {
 			c.mu.Unlock()
 			return nil
 		}

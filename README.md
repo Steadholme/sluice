@@ -40,6 +40,7 @@ go run ./cmd/sluice -config config.json
 |------|------|------|
 | `LISTEN_ADDR` | 监听地址（覆盖 `listen_addr`） | `127.0.0.1:9090` |
 | `KEYSTONE_ISSUER` | 期望 OIDC issuer（覆盖 `keystone_issuer`，并重新派生 discovery） | `http://127.0.0.1:8080` |
+| `JWKS_ROTATION_COOLDOWN` | 健康缓存遇未知 kid 时的**反应式**刷新冷却（Go duration，如 `5s`）；冷却内视为垃圾 kid 风暴并抑制刷新，过冷却即视为 kid 轮换并立即刷新 | `5s` |
 | `SLUICE_STORE` | 路由 store：`static` 或 `postgres` | `static` |
 | `DATABASE_URL` | Postgres DSN（`SLUICE_STORE=postgres` 时必填） | 空 |
 | `ROUTES_SEED` | Postgres 播种用的路由配置文件路径（可选，缺省用 `-config` 里的 routes） | 空 |
@@ -71,7 +72,8 @@ curl http://127.0.0.1:9090/healthz   # -> ok
   "listen_addr": "127.0.0.1:9090",            // 监听地址
   "keystone_issuer": "http://127.0.0.1:8080", // 期望的 OIDC issuer（校验 iss）
   "discovery_url": "",                         // 可选；留空则由 issuer 派生 /.well-known/openid-configuration
-  "jwks_refresh_interval": 300000000000,       // time.Duration（纳秒）；300000000000 = 5 分钟
+  "jwks_refresh_interval": 300000000000,       // time.Duration（纳秒）；300000000000 = 5 分钟（proactive 间隔）
+  "jwks_rotation_cooldown": 5000000000,        // time.Duration（纳秒）；5000000000 = 5 秒（kid 轮换反应式冷却）
   "routes": [
     { "name": "public-api",    "match": { "path_prefix": "/public" }, "upstream": "http://127.0.0.1:8081", "protected": false },
     { "name": "protected-api", "match": { "host": "api.local", "path_prefix": "/api" }, "upstream": "http://127.0.0.1:8082", "protected": true }
@@ -79,7 +81,8 @@ curl http://127.0.0.1:9090/healthz   # -> ok
 }
 ```
 
-注意：`jwks_refresh_interval` 是 Go `time.Duration`，JSON 中以纳秒整数表示。
+注意：`jwks_refresh_interval` 与 `jwks_rotation_cooldown` 均为 Go `time.Duration`，JSON 中以纳秒整数表示；
+后者亦可用 `JWKS_ROTATION_COOLDOWN` 以 Go duration 字符串（如 `5s`）覆盖。
 
 ## v0 覆盖范围
 
@@ -88,11 +91,13 @@ curl http://127.0.0.1:9090/healthz   # -> ok
 - 流式反向代理 + `X-Forwarded-*` 注入。
 - 受保护路由的 RS256 forward-auth：OIDC discovery、JWKS 按 `kid` 缓存；校验 `iss` + `exp`，
   固定算法 RS256（抵御 `alg=none` 与 RS->HS 混淆）。
-- **JWKS 按需刷新韧性**：kid-miss 时按缓存健康度决定行为——健康缓存（已成功刷新且在
-  `minRefresh` 内）将 miss 视为真未知 kid（轮换/垃圾 kid 护栏），冷/失败缓存则强制刷新且
-  不受成功冷却抑制；并发刷新经 `singleflight` 合并为单次上游抓取；仅对**重复失败**施加有界
+- **JWKS 按需刷新韧性**：kid-miss 时按缓存健康度决定行为——健康缓存对未知 kid 用**短反应式
+  冷却** `rotationCooldown`（默认 5s，可经 `JWKS_ROTATION_COOLDOWN` 配置）作护栏：冷却内视为
+  垃圾 kid 风暴并抑制刷新，过冷却即视为真实签名密钥轮换并立即刷新（`singleflight` 合并为单次
+  上游抓取），因此 Keystone 重启轮换 kid 后**数秒内**即被接管，而非等待 `jwks_refresh_interval`
+  这一更长的 proactive 间隔；冷/失败缓存则强制刷新且不受成功冷却抑制；仅对**重复失败**施加有界
   指数退避，首次重试立即放行——因此 Keystone 启动时不可达不会让 forward-auth 长期卡在 401，
-  恢复后首个请求即放行（见 `internal/auth/jwks_recovery_test.go`）。
+  恢复后首个请求即放行（见 `internal/auth/jwks_recovery_test.go` 与 `jwks_rotation_test.go`）。
 - **可移植 Postgres 路由数据层**（`SLUICE_STORE=postgres`）：`pgx/v5` + 幂等
   `CREATE TABLE IF NOT EXISTS`，仅用标准 SQL，空表时从配置 routes 幂等播种；默认仍走静态
   内存 store，现有测试无需数据库。

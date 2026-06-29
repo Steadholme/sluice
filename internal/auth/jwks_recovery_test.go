@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,6 +28,13 @@ type jwksTestServer struct {
 	discHits  atomic.Int64
 	jwksDelay time.Duration
 	issuer    string
+	rotations atomic.Int64
+
+	// keyMu guards the currently-served signing key/kid so a test can rotate it
+	// (simulating a Keystone restart) concurrently with in-flight JWKS fetches.
+	keyMu   sync.Mutex
+	curPriv *rsa.PrivateKey
+	curKID  string
 }
 
 func newJWKSTestServer(t *testing.T) *jwksTestServer {
@@ -35,7 +43,7 @@ func newJWKSTestServer(t *testing.T) *jwksTestServer {
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	s := &jwksTestServer{priv: priv}
+	s := &jwksTestServer{priv: priv, curPriv: priv, curKID: recoveryKID}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
@@ -56,24 +64,53 @@ func newJWKSTestServer(t *testing.T) *jwksTestServer {
 			time.Sleep(d)
 		}
 		s.jwksHits.Add(1)
-		pub := &priv.PublicKey
-		nStr := base64.RawURLEncoding.EncodeToString(pub.N.Bytes())
-		var eBuf [4]byte
-		binary.BigEndian.PutUint32(eBuf[:], uint32(pub.E))
-		eBytes := eBuf[:]
-		for len(eBytes) > 1 && eBytes[0] == 0 {
-			eBytes = eBytes[1:]
-		}
-		eStr := base64.RawURLEncoding.EncodeToString(eBytes)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"` +
-			recoveryKID + `","n":"` + nStr + `","e":"` + eStr + `"}]}`))
+		_, _ = w.Write(s.jwksJSON())
 	})
 
 	s.server = httptest.NewServer(mux)
 	s.issuer = s.server.URL
 	t.Cleanup(s.server.Close)
 	return s
+}
+
+// jwksJSON serializes the currently-served signing key as a single-key JWKS
+// document. Reading the current key under keyMu lets rotate run concurrently
+// with an in-flight fetch.
+func (s *jwksTestServer) jwksJSON() []byte {
+	s.keyMu.Lock()
+	priv, kid := s.curPriv, s.curKID
+	s.keyMu.Unlock()
+
+	pub := &priv.PublicKey
+	nStr := base64.RawURLEncoding.EncodeToString(pub.N.Bytes())
+	var eBuf [4]byte
+	binary.BigEndian.PutUint32(eBuf[:], uint32(pub.E))
+	eBytes := eBuf[:]
+	for len(eBytes) > 1 && eBytes[0] == 0 {
+		eBytes = eBytes[1:]
+	}
+	eStr := base64.RawURLEncoding.EncodeToString(eBytes)
+	return []byte(`{"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"` +
+		kid + `","n":"` + nStr + `","e":"` + eStr + `"}]}`)
+}
+
+// rotate swaps the served signing key for a freshly generated one under a new
+// kid, simulating a Keystone restart that regenerates its RSA key (the v0
+// behaviour this fix defends against). It returns the new private key and kid so
+// a test can mint tokens against the rotation.
+func (s *jwksTestServer) rotate(t *testing.T) (*rsa.PrivateKey, string) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rotate key: %v", err)
+	}
+	kid := "kid-rotated-" + strconv.Itoa(int(s.rotations.Add(1)))
+	s.keyMu.Lock()
+	s.curPriv = priv
+	s.curKID = kid
+	s.keyMu.Unlock()
+	return priv, kid
 }
 
 func (s *jwksTestServer) discoveryURL() string {
