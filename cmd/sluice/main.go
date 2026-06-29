@@ -233,9 +233,19 @@ func healthcheckTarget() (scheme, addr string, client *http.Client) {
 		if addr == "" {
 			addr = config.DefaultHTTPSAddr
 		}
+		tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // loopback probe; hostname verified out-of-band
+		// In acme mode autocert's HostPolicy only serves the whitelisted domain,
+		// so the loopback probe MUST present that SNI or the handshake is rejected
+		// (tls: internal error). InsecureSkipVerify still ignores the 127.0.0.1
+		// vs id.w33d.xyz hostname mismatch on the dialed loopback address.
+		if mode == config.TLSModeACME {
+			if domain := os.Getenv(config.EnvACMEDomain); domain != "" {
+				tlsCfg.ServerName = domain
+			}
+		}
 		client = &http.Client{
 			Timeout:   timeout,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+			Transport: &http.Transport{TLSClientConfig: tlsCfg},
 		}
 		return "https", addr, client
 	}
