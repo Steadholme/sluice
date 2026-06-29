@@ -116,6 +116,14 @@ const (
 	EnvKeystoneTLSServerName = "KEYSTONE_TLS_SERVERNAME" // pinned server name (default "keystone")
 )
 
+// Audit (Watchtower) environment variables. All optional; AUDIT_ENABLED defaults
+// off so existing dev/tests are unchanged. When off, no audit events are emitted.
+const (
+	EnvAuditEnabled     = "AUDIT_ENABLED"      // on|off — emit security audit events to Watchtower (default off)
+	EnvWatchtowerURL    = "WATCHTOWER_URL"     // Watchtower base URL, e.g. http://watchtower:8500
+	EnvAuditIngestToken = "AUDIT_INGEST_TOKEN" // bearer credential for POST /events
+)
+
 // DefaultGWSessionTTL is the gateway browser-session lifetime when unset.
 const DefaultGWSessionTTL = 8 * time.Hour
 
@@ -196,6 +204,13 @@ type Config struct {
 	KeystoneMTLSKey       string `json:"keystone_mtls_key"`
 	KeystoneMTLSCA        string `json:"keystone_mtls_ca"`
 	KeystoneTLSServerName string `json:"keystone_tls_servername"`
+
+	// Audit to Watchtower. Off by default (AuditEnabled=false) so the gateway
+	// emits nothing and behavior is unchanged. When on, security-relevant gateway
+	// actions are fire-and-forget POSTed to WatchtowerURL with AuditIngestToken.
+	AuditEnabled     bool   `json:"audit_enabled"`
+	WatchtowerURL    string `json:"watchtower_url"`
+	AuditIngestToken string `json:"audit_ingest_token"`
 
 	Routes []Route `json:"routes"`
 }
@@ -343,6 +358,17 @@ func (c *Config) ApplyEnv() {
 	}
 	if v := os.Getenv(EnvKeystoneTLSServerName); v != "" {
 		c.KeystoneTLSServerName = v
+	}
+
+	// Audit overrides.
+	if v := os.Getenv(EnvAuditEnabled); v != "" {
+		c.AuditEnabled = envOn(v)
+	}
+	if v := os.Getenv(EnvWatchtowerURL); v != "" {
+		c.WatchtowerURL = v
+	}
+	if v := os.Getenv(EnvAuditIngestToken); v != "" {
+		c.AuditIngestToken = v
 	}
 }
 

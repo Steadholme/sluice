@@ -271,6 +271,38 @@ func TestApplyEnvGatewayOIDCAndMTLS(t *testing.T) {
 	}
 }
 
+// Audit env overrides apply, and AuditEnabled stays OFF by default (so the
+// gateway emits nothing unless explicitly toggled on).
+func TestApplyEnvAuditOverrides(t *testing.T) {
+	def := minimalValid()
+	def.ApplyEnv()
+	if err := def.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if def.AuditEnabled {
+		t.Error("AuditEnabled must default OFF")
+	}
+
+	t.Setenv(EnvAuditEnabled, "on")
+	t.Setenv(EnvWatchtowerURL, "http://watchtower:8500")
+	t.Setenv(EnvAuditIngestToken, "ingest-token")
+
+	c := minimalValid()
+	c.ApplyEnv()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !c.AuditEnabled {
+		t.Error("AuditEnabled = false, want true")
+	}
+	if c.WatchtowerURL != "http://watchtower:8500" {
+		t.Errorf("WatchtowerURL = %q, want http://watchtower:8500", c.WatchtowerURL)
+	}
+	if c.AuditIngestToken != "ingest-token" {
+		t.Errorf("AuditIngestToken = %q, want ingest-token", c.AuditIngestToken)
+	}
+}
+
 func TestGatewayDefaults(t *testing.T) {
 	c := minimalValid()
 	if err := c.Validate(); err != nil {
