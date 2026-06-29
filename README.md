@@ -54,6 +54,18 @@ go run ./cmd/sluice -config config.json
 | `SLUICE_STORE` | 路由 store：`static` 或 `postgres` | `static` |
 | `DATABASE_URL` | Postgres DSN（`SLUICE_STORE=postgres` 时必填） | 空 |
 | `ROUTES_SEED` | Postgres 播种用的路由配置文件路径（可选，缺省用 `-config` 里的 routes） | 空 |
+| `GW_OIDC` | 启用 OIDC **浏览器 SSO** Relying Party：`on`/`off` | `off` |
+| `OIDC_ISSUER` | SSO 用的**公网** issuer（authorize 跳转 + id_token `iss`/`aud` 校验） | 取 `KEYSTONE_ISSUER` |
+| `GW_CLIENT_ID` | 网关在 Keystone 注册的 OIDC `client_id` | 空 |
+| `GW_CLIENT_SECRET` | 网关 client secret（token 端点 `client_secret_post`） | 空 |
+| `GW_REDIRECT_URI` | **公网** 回调地址，须为 `https://id.w33d.xyz/_gw/auth/callback` | 空 |
+| `GW_TOKEN_URL` | **内网** token 端点（开 mTLS 时 `https://keystone:8443/token`，否则 `http://keystone:8080/token`） | 空 |
+| `GW_SESSION_TTL` | 网关浏览器会话有效期（Go duration，如 `8h`） | `8h` |
+| `GW_SESSION_SECRET` | 签名 `__Host-gw` 不透明 cookie id 的 HMAC 密钥（强随机、稳定） | 空（缺省临时随机，重启失效） |
+| `INTERNAL_MTLS` | 到 Keystone 内网跳启用 **mTLS**：`on`/`off` | `off` |
+| `KEYSTONE_MTLS_CERT` / `KEYSTONE_MTLS_KEY` | Keyward 签发的客户端证书 + 私钥（CN=sluice，PEM） | 空 |
+| `KEYSTONE_MTLS_CA` | 信任锚 PEM（Keyward root CA） | 空 |
+| `KEYSTONE_TLS_SERVERNAME` | 内网 mTLS 校验的 server name（SNI/证书主机） | `keystone` |
 
 ### TLS 终止与公网暴露
 
@@ -96,6 +108,53 @@ export SLUICE_STORE=postgres
 export DATABASE_URL='postgres://postgres:pw@127.0.0.1:5432/sluice'
 go run ./cmd/sluice -config config.json
 ```
+
+### 路由鉴权三模式：`public` / `bearer` / `sso`
+
+每条路由新增可选 `auth` 字段，泛化原来的 `protected` 布尔：
+
+- **`public`**：不鉴权，直接反代（等价 `protected:false`）。
+- **`bearer`**：现有 **API forward-auth**——要求 `Authorization: Bearer <RS256 JWT>`，
+  校验通过注入 `X-Auth-*`，失败 `401`（等价 `protected:true`）。**行为完全不变。**
+- **`sso`**：新增 **浏览器 SSO**——见下。
+
+向后兼容：`auth` 留空时由 `protected` 派生（`true→bearer`、`false→public`），
+因此既有配置文件与 Postgres 路由行**零改动、行为不变**；显式写 `auth` 即覆盖。
+Postgres `routes` 表自动新增 `auth` 列（旧库经幂等 `ALTER ... ADD COLUMN IF NOT
+EXISTS` 回填，旧行 `auth=''` 仍按 `protected` 派生）。
+
+### OIDC 浏览器 SSO（`GW_OIDC=on`）
+
+这是「**每个公网 base-service UI 都挂到 Keystone SSO 后面**」的机制。`auth=sso`
+的路由把**浏览器**门禁到 Keystone 登录：
+
+1. 无有效网关会话（`__Host-gw` cookie）→ 用 `authorization_code` + PKCE S256
+   `302` 跳到 Keystone **公网** `OIDC_ISSUER/authorize`（带 `client_id=GW_CLIENT_ID`、
+   `redirect_uri=GW_REDIRECT_URI`、`scope="openid email profile"`、`state`、`nonce`、
+   `code_challenge`）。`{state,nonce,code_verifier,original_url}` 以 `state` 为键短时
+   持久化（Postgres `gw_oauth_state` 或内存）。
+2. 用户在 Keystone 完成口令/passkey 登录后带 `code` 回到 **Sluice 自服务**端点
+   `GET /_gw/auth/callback`（**不被反代**，路由匹配前拦截）：校验单次 `state`、在
+   **内网** token 端点（可走 mTLS，见下）以 `client_secret_post` + PKCE verifier 换码，
+   用共享 JWKS 校验 `id_token` 签名与 `iss==OIDC_ISSUER`/`aud==GW_CLIENT_ID`/`nonce`/`exp`，
+   建网关会话（`gw_sessions`），下发**签名不透明** `__Host-gw` cookie（`Secure`、`HttpOnly`、
+   `SameSite=Lax`），`302` 回 `original_url`。
+3. 持有效 `__Host-gw` 会话的请求 → 注入 `X-Auth-Subject` / `X-Auth-Email` /
+   `X-Auth-Scope` 并反代上游。`GET /_gw/auth/logout` 清会话与 cookie。
+
+**与 Bearer API 路径并存且互不影响**：`bearer` 路由仍只认 `Authorization: Bearer`；
+公网口令/passkey 登录 UI（反代 Keystone 的 `/login`、`/webauthn/` 等公开路由）照常工作。
+整套 SSO 由 `GW_OIDC` 开关控制，**关闭即完全不经过该路径**；开启但配置不全时，
+provider 构建失败仅令 `sso` 路由 `503`（fail-closed），`bearer`/`public` 不受影响。
+
+### 内网 mTLS 到 Keystone（`INTERNAL_MTLS=on`）
+
+Sluice 到 Keystone 的**内网 server-to-server 跳**（反代上游 + OIDC token/JWKS 抓取）
+启用双向 TLS：出示 Keyward 签发的客户端证书（`CN=sluice`），仅信任 Keyward root CA，
+固定 `ServerName`（默认 `keystone`）。开启后把 Keystone 上游与 `GW_TOKEN_URL`/`JWKS_FETCH_URL`
+指向 `https://keystone:8443/...`；反代仅对 **https 上游**挂 mTLS transport，明文上游不变。
+开关 `off` 时维持原 `http://keystone:8080`。构建失败（缺证书/格式错）自动降级回明文，
+**不拖垮网关**。
 
 ### 容器运行
 
@@ -183,10 +242,14 @@ internal/store/postgres.go    pgx/v5 PostgresStore：幂等迁移 + 空表播种
 internal/auth/jwks.go         OIDC discovery + JWKS 抓取 + RSA 公钥重建 + kid 缓存 + singleflight/退避恢复
 Dockerfile / .dockerignore    多阶段静态构建 -> scratch 非 root 运行，-healthcheck 驱动 HEALTHCHECK
 internal/auth/verifier.go     基于 golang-jwt 的 RS256/iss/exp 校验
-internal/auth/middleware.go   forward-auth 中间件
+internal/auth/middleware.go   forward-auth 中间件 + Identity（含 Email）+ ContextWithIdentity
+internal/mtls/mtls.go         内网 mTLS 客户端 transport/Client 构建（Keyward 客户端证书 + root CA + ServerName）
+internal/oidc/oidc.go         OIDC 浏览器 SSO Relying Party：Middleware、/_gw 回调与登出、PKCE、签名 cookie、id_token 校验
+internal/oidc/store.go        gw 会话/状态接口 + 内存实现（测试/静态部署）
+internal/oidc/postgres.go     gw_sessions / gw_oauth_state 的 Postgres 实现（可移植标准 SQL，state 事务内单次消费）
 internal/gateway/router.go    路由匹配（Host 精确 + 最长前缀）
-internal/gateway/proxy.go     基于 ReverseProxy 的流式代理（X-Forwarded-* 注入、保留 Host、X-Auth-* 剥离）
+internal/gateway/proxy.go     基于 ReverseProxy 的流式代理（X-Forwarded-* 注入、保留 Host、X-Auth-* 剥离/注入、https 上游挂 mTLS）
 internal/gateway/tls.go       file 模式证书加载、acme autocert.Manager 构建、:80 HTTP→HTTPS 跳转
-internal/gateway/server.go    HTTP handler 组装（healthz、路由分发、鉴权包裹、访问日志）
+internal/gateway/server.go    HTTP handler 组装（healthz、/_gw 拦截、路由分发、public/bearer/sso 三模式鉴权、访问日志）
 internal/accesslog/           slog JSON 访问日志包裹器
 ```
