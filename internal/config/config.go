@@ -26,6 +26,23 @@ const (
 	discoverySuffix = "/.well-known/openid-configuration"
 )
 
+// Environment variable names that override the dev-contract defaults. They are
+// applied by ApplyEnv before Validate, so an unset variable keeps the file/built
+// in default unchanged.
+const (
+	EnvListenAddr     = "LISTEN_ADDR"     // overrides listen_addr
+	EnvKeystoneIssuer = "KEYSTONE_ISSUER" // overrides keystone_issuer (and re-derives discovery)
+	EnvStore          = "SLUICE_STORE"    // route store kind: static|postgres (default static)
+	EnvDatabaseURL    = "DATABASE_URL"    // postgres DSN (postgres store)
+	EnvRoutesSeed     = "ROUTES_SEED"     // path to a routes seed config (postgres store)
+)
+
+// Store kinds selectable via EnvStore.
+const (
+	StoreStatic   = "static"
+	StorePostgres = "postgres"
+)
+
 // Match describes how an incoming request is matched to a Route.
 //
 // Host is optional: when set it must equal the request Host exactly. PathPrefix
@@ -63,8 +80,8 @@ type Config struct {
 	Routes              []Route       `json:"routes"`
 }
 
-// LoadFile reads and validates a configuration file from disk.
-func LoadFile(path string) (*Config, error) {
+// parseFile reads and JSON-decodes a configuration file without validating it.
+func parseFile(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
@@ -73,10 +90,50 @@ func LoadFile(path string) (*Config, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
+	return &c, nil
+}
+
+// LoadFile reads and validates a configuration file from disk.
+func LoadFile(path string) (*Config, error) {
+	c, err := parseFile(path)
+	if err != nil {
+		return nil, err
+	}
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("config: validate %s: %w", path, err)
 	}
-	return &c, nil
+	return c, nil
+}
+
+// LoadFileWithEnv reads a configuration file, applies environment overrides
+// (ApplyEnv), then validates. This is the entrypoint used by the binary so that
+// every dev-contract default is overridable by env while staying unchanged when
+// the env is unset.
+func LoadFileWithEnv(path string) (*Config, error) {
+	c, err := parseFile(path)
+	if err != nil {
+		return nil, err
+	}
+	c.ApplyEnv()
+	if err := c.Validate(); err != nil {
+		return nil, fmt.Errorf("config: validate %s: %w", path, err)
+	}
+	return c, nil
+}
+
+// ApplyEnv overlays environment overrides onto the configuration. It must be
+// called before Validate. Unset variables leave the existing value untouched.
+// Overriding the issuer clears any derived discovery URL so Validate re-derives
+// it from the new issuer.
+func (c *Config) ApplyEnv() {
+	if v := os.Getenv(EnvListenAddr); v != "" {
+		c.ListenAddr = v
+	}
+	if v := os.Getenv(EnvKeystoneIssuer); v != "" {
+		c.KeystoneIssuer = v
+		// Re-derive discovery from the new issuer (Validate does this when empty).
+		c.DiscoveryURL = ""
+	}
 }
 
 // Validate applies defaults, parses upstream URLs, derives the discovery URL,
