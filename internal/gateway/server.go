@@ -97,9 +97,10 @@ func authWrap(route config.Route, proxy http.Handler, opts Options) http.Handler
 	}
 }
 
-// Handler returns the top-level http.Handler with access logging applied.
+// Handler returns the top-level http.Handler with baseline security headers (outermost, so
+// they apply to every response incl. error/redirect paths) and access logging applied.
 func (s *Server) Handler() http.Handler {
-	return accesslog.Wrap(http.HandlerFunc(s.serve))
+	return secureHeaders(accesslog.Wrap(http.HandlerFunc(s.serve)))
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
