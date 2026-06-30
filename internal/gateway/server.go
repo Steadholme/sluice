@@ -10,6 +10,7 @@ import (
 	"github.com/holdfast/sluice/internal/config"
 	"github.com/holdfast/sluice/internal/oidc"
 	"github.com/holdfast/sluice/internal/store"
+	"github.com/holdfast/sluice/internal/waf"
 )
 
 // routeHandler pairs a matched route with its prepared handler so the access
@@ -28,11 +29,15 @@ type routeHandler struct {
 //     Keystone hop); when nil, https upstreams use the default transport.
 //   - Auditor is the non-blocking audit emitter; when nil, no audit events are
 //     emitted (and the request path is identical).
+//   - WAF is the inline WAF + rate limiter (Aegis); when nil (or disabled) no
+//     route is wrapped and the request path is identical. Only routes with
+//     Waf=true are wrapped, so the WAF is opt-in even when the engine is enabled.
 type Options struct {
 	Verifier  *auth.Verifier
 	Provider  *oidc.Provider
 	Transport *http.Transport
 	Auditor   *audit.Emitter
+	WAF       *waf.Engine
 }
 
 // Server is the assembled Sluice HTTP handler: /healthz, the gateway-owned
@@ -57,9 +62,17 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 	}
 	for _, route := range s.Routes() {
 		proxy := newReverseProxy(route, opts.Transport)
+		// Auth wraps the proxy; the WAF (when enabled AND this route opted in)
+		// wraps the auth handler so malicious traffic is rejected before auth runs.
+		// opts.WAF is nil when WAF_ENABLED is off, and Middleware is a pass-through
+		// for routes that did not opt in — so unflagged routes are byte-identical.
+		handler := authWrap(route, proxy, opts)
+		if route.Waf {
+			handler = opts.WAF.Middleware(handler)
+		}
 		srv.handlers[routeKey(route)] = routeHandler{
 			route:   route,
-			handler: authWrap(route, proxy, opts),
+			handler: handler,
 		}
 	}
 	return srv

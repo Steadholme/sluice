@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -125,6 +126,29 @@ const (
 	EnvAuditIngestToken = "AUDIT_INGEST_TOKEN" // bearer credential for POST /events
 )
 
+// WAF (Aegis inline WAF + rate limiter) environment variables. All optional;
+// WAF_ENABLED defaults OFF so the public ingress keeps its exact current
+// behavior. Even when enabled the WAF only engages on routes opted in with
+// waf=true, so an unset deployment is a pure pass-through.
+const (
+	EnvWAFEnabled      = "WAF_ENABLED"        // on|off — enable the inline WAF + rate limiter (default off)
+	EnvWAFThreshold    = "WAF_THRESHOLD"      // int — block when the accumulated rule score >= threshold
+	EnvWAFRateBurst    = "WAF_RATE_BURST"     // int — max requests per client within the rate window (0 disables rate limiting)
+	EnvWAFRateWindow   = "WAF_RATE_WINDOW"    // Go duration — sliding rate-limit window (e.g. "1m")
+	EnvWAFMaxBodyBytes = "WAF_MAX_BODY_BYTES" // int64 — request body inspection/size cap in bytes (0 disables the cap)
+	EnvWAFUploadTypes  = "WAF_UPLOAD_TYPES"   // comma list — allowed upload content-types; empty allows all
+)
+
+// WAF defaults. The threshold matches the embedded ruleset, where a single
+// critical detection (score 5) blocks; the rate window/burst default to a
+// generous 120 requests/minute per client; the body cap defaults to 10 MiB.
+const (
+	DefaultWAFThreshold    = 5
+	DefaultWAFRateBurst    = 120
+	DefaultWAFRateWindow   = time.Minute
+	DefaultWAFMaxBodyBytes = 10 << 20 // 10 MiB
+)
+
 // DefaultGWSessionTTL is the gateway browser-session lifetime when unset.
 const DefaultGWSessionTTL = 8 * time.Hour
 
@@ -156,6 +180,13 @@ type Route struct {
 	// existing configs and route rows keep their exact behavior. Protected is in
 	// turn re-synced to (Auth != "public") for any legacy reader.
 	Auth string `json:"auth,omitempty"`
+
+	// Waf opts this route into the inline WAF + rate limiter (Aegis). It is
+	// OPTIONAL and defaults off: an absent field in routes.seed.json (or a
+	// pre-existing route row) parses to false, so the WAF never engages unless a
+	// route is explicitly flagged AND WAF_ENABLED is on. This keeps the public
+	// ingress behavior identical until both switches are set.
+	Waf bool `json:"waf,omitempty"`
 
 	// upstreamURL is the parsed form of Upstream, populated by Validate so the
 	// data path never re-parses on the hot path. Unexported so it is not part
@@ -220,6 +251,17 @@ type Config struct {
 	AuditEnabled     bool   `json:"audit_enabled"`
 	WatchtowerURL    string `json:"watchtower_url"`
 	AuditIngestToken string `json:"audit_ingest_token"`
+
+	// WAF (Aegis). Off by default (WAFEnabled=false) so the gateway is a pure
+	// pass-through and the public ingress is unchanged. When on, only routes with
+	// Waf=true are inspected. Threshold/rate/body-cap defaults are applied by
+	// Validate.
+	WAFEnabled      bool          `json:"waf_enabled"`
+	WAFThreshold    int           `json:"waf_threshold"`
+	WAFRateBurst    int           `json:"waf_rate_burst"`
+	WAFRateWindow   time.Duration `json:"waf_rate_window"`
+	WAFMaxBodyBytes int64         `json:"waf_max_body_bytes"`
+	WAFUploadTypes  []string      `json:"waf_upload_types"`
 
 	Routes []Route `json:"routes"`
 }
@@ -382,6 +424,47 @@ func (c *Config) ApplyEnv() {
 	if v := os.Getenv(EnvAuditIngestToken); v != "" {
 		c.AuditIngestToken = v
 	}
+
+	// WAF overrides. A malformed numeric/duration value is treated as unset so
+	// Validate applies the default, never taking the gateway down on a typo.
+	if v := os.Getenv(EnvWAFEnabled); v != "" {
+		c.WAFEnabled = envOn(v)
+	}
+	if v := os.Getenv(EnvWAFThreshold); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			c.WAFThreshold = n
+		}
+	}
+	if v := os.Getenv(EnvWAFRateBurst); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			c.WAFRateBurst = n
+		}
+	}
+	if v := os.Getenv(EnvWAFRateWindow); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			c.WAFRateWindow = d
+		}
+	}
+	if v := os.Getenv(EnvWAFMaxBodyBytes); v != "" {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
+			c.WAFMaxBodyBytes = n
+		}
+	}
+	if v := os.Getenv(EnvWAFUploadTypes); v != "" {
+		c.WAFUploadTypes = splitList(v)
+	}
+}
+
+// splitList parses a comma-separated env value into a trimmed, non-empty slice.
+func splitList(v string) []string {
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // envOn parses a boolean-ish toggle. "on", "true", "1", "yes" (any case) enable;
@@ -423,6 +506,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 	c.applyGatewayDefaults()
+	c.applyWAFDefaults()
 
 	if len(c.Routes) == 0 {
 		return fmt.Errorf("no routes configured")
@@ -527,6 +611,30 @@ func (c *Config) applyGatewayDefaults() {
 	}
 	if c.KeystoneTLSServerName == "" {
 		c.KeystoneTLSServerName = "keystone"
+	}
+}
+
+// applyWAFDefaults fills in the WAF tuning knobs. Like the OIDC defaults it never
+// hard-fails: the WAF is built best-effort in main and stays a pass-through when
+// disabled, so an incomplete configuration degrades to the unchanged behavior.
+func (c *Config) applyWAFDefaults() {
+	if c.WAFThreshold <= 0 {
+		c.WAFThreshold = DefaultWAFThreshold
+	}
+	if c.WAFRateBurst < 0 {
+		c.WAFRateBurst = 0
+	}
+	if c.WAFRateBurst == 0 {
+		c.WAFRateBurst = DefaultWAFRateBurst
+	}
+	if c.WAFRateWindow <= 0 {
+		c.WAFRateWindow = DefaultWAFRateWindow
+	}
+	if c.WAFMaxBodyBytes < 0 {
+		c.WAFMaxBodyBytes = 0
+	}
+	if c.WAFMaxBodyBytes == 0 {
+		c.WAFMaxBodyBytes = DefaultWAFMaxBodyBytes
 	}
 }
 

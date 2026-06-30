@@ -20,6 +20,7 @@ import (
 	"github.com/holdfast/sluice/internal/mtls"
 	"github.com/holdfast/sluice/internal/oidc"
 	"github.com/holdfast/sluice/internal/store"
+	"github.com/holdfast/sluice/internal/waf"
 )
 
 func main() {
@@ -93,6 +94,26 @@ func main() {
 	provider, closeProvider := buildProvider(cfg, jwks, internalClient, auditor, log)
 	defer closeProvider()
 
+	// Inline WAF + rate limiter (Aegis), env-toggled by WAF_ENABLED. Off by default:
+	// a disabled engine is a pass-through and only routes flagged waf=true are
+	// inspected even when on, so the public ingress keeps its exact behavior until
+	// both switches are set. Blocked/flagged events reuse the same non-blocking
+	// audit emitter, so Watchtower being down can never affect the request path.
+	wafEngine := waf.New(waf.Config{
+		Enabled:            cfg.WAFEnabled,
+		Threshold:          cfg.WAFThreshold,
+		RateBurst:          cfg.WAFRateBurst,
+		RateWindow:         cfg.WAFRateWindow,
+		MaxBodyBytes:       cfg.WAFMaxBodyBytes,
+		AllowedUploadTypes: cfg.WAFUploadTypes,
+		// The trusted edge (Sluice's own ingress / load balancer) populates
+		// X-Forwarded-For, so honor it for the per-client rate-limit key.
+		TrustForwardedFor: true,
+		Auditor:           auditor,
+		Log:               log,
+	})
+	defer wafEngine.Close()
+
 	// In acme mode the autocert HostPolicy is the live route hosts ∪ the apex ∪ the
 	// legacy ACME_DOMAIN, so we hand serve() the same route store to read from.
 	acmeHosts := gateway.RouteHostSet(routeStore, cfg.ACMEDomain, apexHost(cfg))
@@ -102,6 +123,7 @@ func main() {
 		Provider:  provider,
 		Transport: mtlsTransport,
 		Auditor:   auditor,
+		WAF:       wafEngine,
 	})
 
 	log.Info("sluice listening",
@@ -112,6 +134,7 @@ func main() {
 		"internal_mtls", mtlsTransport != nil,
 		"oidc_sso", provider != nil,
 		"audit", cfg.AuditEnabled,
+		"waf", cfg.WAFEnabled,
 	)
 	if err := serve(log, cfg, srv.Handler(), acmeHosts); err != nil {
 		log.Error("server stopped", "error", err)

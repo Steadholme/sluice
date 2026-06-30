@@ -44,6 +44,13 @@ const (
 	ActionSSOEstablish     = "sso.session.establish"
 	ActionSSODeny          = "sso.session.deny"
 	ActionSSOLogout        = "sso.logout"
+
+	// WAF (Aegis) actions. Block is emitted when a request is rejected (rule score
+	// over threshold, rate limit exceeded, body too large, or upload type denied);
+	// Flag is emitted when a request scores above zero but below the block
+	// threshold and is allowed through.
+	ActionWAFBlock = "waf.block"
+	ActionWAFFlag  = "waf.flag"
 )
 
 const (
