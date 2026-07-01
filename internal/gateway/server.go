@@ -123,8 +123,15 @@ func authWrap(route config.Route, proxy http.Handler, opts Options) http.Handler
 		// identity. When the authorizer is disabled/unconfigured or the route names
 		// no group, inner stays the bare proxy (byte-identical behavior).
 		inner := proxy
-		if route.RequireGroup != "" && opts.Authz.Enabled() {
-			inner = opts.Authz.Gate(route.RequireGroup, proxy)
+		if opts.Authz.Enabled() {
+			if route.RequireGroup != "" {
+				// Gate: fail-closed membership check (also injects id.Groups).
+				inner = opts.Authz.Gate(route.RequireGroup, proxy)
+			} else {
+				// Plain SSO route: inject the user's groups (fail-open) so the backend can
+				// run its OWN group-based authorization (e.g. moderator-only actions).
+				inner = opts.Authz.InjectOnly(proxy)
+			}
 		}
 		return opts.Provider.Middleware(inner)
 	default: // config.AuthPublic

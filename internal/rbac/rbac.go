@@ -106,6 +106,22 @@ func (a *Authorizer) Gate(group string, next http.Handler) http.Handler {
 	})
 }
 
+// InjectOnly resolves the subject's group memberships and records them on the Identity
+// WITHOUT any gating, so backends on plain (non-require_group) SSO routes still receive a
+// trustworthy X-Auth-Groups header for their OWN fine-grained authorization (e.g. Echo's
+// moderator check). Unlike Gate this FAILS OPEN: a Verdict error injects no groups but never
+// blocks the request — group injection is advisory for the backend, not an access decision here.
+func (a *Authorizer) InjectOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if id, ok := auth.IdentityFromContext(r.Context()); ok && id.Subject != "" {
+			if groups, err := a.groupsFor(r.Context(), "user:"+id.Subject); err == nil {
+				id.Groups = stripPrefix(groups)
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // groupsFor returns the raw group object ids the subject is a member of, backed
 // by a per-subject TTL cache. On a Verdict error a stale entry is returned if
 // present (so a transient blip does not lock out an already-verified admin); a
