@@ -131,14 +131,15 @@ func main() {
 	acmeHosts := gateway.RouteHostSet(routeStore, cfg.ACMEDomain, apexHost(cfg))
 
 	srv := gateway.NewServer(routeStore, gateway.Options{
-		Verifier:  verifier,
-		Provider:  provider,
-		Transport: mtlsTransport,
-		Auditor:   auditor,
-		WAF:       wafEngine,
-		Authz:     authz,
-		PublicOnly: cfg.PublicOnly,
-		GatewayHMACKey: cfg.GatewayHMACKey,
+		Verifier:             verifier,
+		Provider:             provider,
+		Transport:            mtlsTransport,
+		Auditor:              auditor,
+		WAF:                  wafEngine,
+		Authz:                authz,
+		PublicOnly:           cfg.PublicOnly,
+		PublicOnlyAllowHosts: hostSet(cfg.PublicOnlyAllow),
+		GatewayHMACKey:       cfg.GatewayHMACKey,
 	})
 
 	log.Info("sluice listening",
@@ -322,6 +323,21 @@ func storeKind() string {
 		return v
 	}
 	return config.StoreStatic
+}
+
+// hostSet turns the PUBLIC_ONLY_ALLOW host list into a lookup set for the gateway's
+// PublicOnly route filter. nil when empty, so strict PublicOnly is the default.
+func hostSet(hosts []string) map[string]bool {
+	if len(hosts) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		if h != "" {
+			set[h] = true
+		}
+	}
+	return set
 }
 
 // buildStore selects the route store from SLUICE_STORE. The default static store

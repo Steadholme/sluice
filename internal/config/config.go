@@ -130,10 +130,10 @@ const (
 // optional; RBAC_ENABLED defaults OFF so an `auth=sso` route's require_group is a
 // no-op until both the flag and Verdict wiring are set.
 const (
-	EnvRBACEnabled          = "RBAC_ENABLED"          // on|off — enable per-route group gating (default off)
-	EnvVerdictURL           = "VERDICT_URL"           // Verdict base URL, e.g. http://verdict:9140
-	EnvVerdictServiceToken  = "VERDICT_SERVICE_TOKEN" // bearer credential for Verdict /api/*
-	EnvGatewayHMACKey       = "GATEWAY_HMAC_KEY"      // HMAC key binding injected identity into X-Auth-Sig
+	EnvRBACEnabled         = "RBAC_ENABLED"          // on|off — enable per-route group gating (default off)
+	EnvVerdictURL          = "VERDICT_URL"           // Verdict base URL, e.g. http://verdict:9140
+	EnvVerdictServiceToken = "VERDICT_SERVICE_TOKEN" // bearer credential for Verdict /api/*
+	EnvGatewayHMACKey      = "GATEWAY_HMAC_KEY"      // HMAC key binding injected identity into X-Auth-Sig
 )
 
 // EnvPublicOnly, when on, makes this Sluice instance a PUBLIC-facing gateway that
@@ -143,6 +143,14 @@ const (
 // consoles are reachable only over the VPN. Default off = serve every route
 // (single-gateway behavior, unchanged).
 const EnvPublicOnly = "PUBLIC_ONLY"
+
+// EnvPublicOnlyAllow is a comma-separated allow-list of hosts that stay served on a
+// PUBLIC_ONLY gateway EVEN when they carry a require_group. Their gate is NOT lifted —
+// SSO + Verdict group gating still runs; this only removes the blanket public-plane 404
+// so a bootstrap surface (the VPN enrollment portal vpn.w33d.xyz) is reachable over
+// public TLS to authenticate and pull WireGuard credentials BEFORE the operator can get
+// onto the VPN. Empty = strict PublicOnly (every require_group route 404s publicly).
+const EnvPublicOnlyAllow = "PUBLIC_ONLY_ALLOW"
 
 // WAF (Aegis inline WAF + rate limiter) environment variables. All optional;
 // WAF_ENABLED defaults OFF so the public ingress keeps its exact current
@@ -292,6 +300,9 @@ type Config struct {
 	// PublicOnly makes this instance drop internal (require_group) routes -> 404,
 	// so the public gateway does not expose the mgmt consoles. Default false.
 	PublicOnly bool `json:"public_only"`
+	// PublicOnlyAllow lists hosts served on a PublicOnly gateway despite a require_group
+	// (their SSO + group gate still applies). Empty = strict PublicOnly. See EnvPublicOnlyAllow.
+	PublicOnlyAllow []string `json:"public_only_allow"`
 
 	// WAF (Aegis). Off by default (WAFEnabled=false) so the gateway is a pure
 	// pass-through and the public ingress is unchanged. When on, only routes with
@@ -481,6 +492,9 @@ func (c *Config) ApplyEnv() {
 	}
 	if v := os.Getenv(EnvPublicOnly); v != "" {
 		c.PublicOnly = envOn(v)
+	}
+	if v := os.Getenv(EnvPublicOnlyAllow); v != "" {
+		c.PublicOnlyAllow = splitList(v)
 	}
 
 	// WAF overrides. A malformed numeric/duration value is treated as unset so

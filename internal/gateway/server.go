@@ -47,6 +47,11 @@ type Options struct {
 	// The companion internal instance runs with PublicOnly=false (serves all) bound
 	// to the VPN interface. Default false = serve every route.
 	PublicOnly bool
+	// PublicOnlyAllowHosts are hosts kept on a PublicOnly gateway even when they carry a
+	// require_group — their SSO + group gate still runs (authWrap is unchanged). Lets a
+	// bootstrap surface (VPN enrollment vpn.w33d.xyz) be reachable over public TLS so an
+	// operator can authenticate and pull credentials before being on the VPN. Empty = strict.
+	PublicOnlyAllowHosts map[string]bool
 	// GatewayHMACKey, when non-empty, HMAC-signs the injected identity into X-Auth-Sig
 	// so backends can verify Sluice minted it. Empty = no signature (backward compatible).
 	GatewayHMACKey string
@@ -75,7 +80,10 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 		// in main.go, so the public instance still issues/renews their certs.
 		kept := make([]config.Route, 0, len(routes))
 		for _, r := range routes {
-			if r.RequireGroup == "" {
+			// Non-internal routes are always public. A require_group route is normally
+			// dropped (404) here, UNLESS its host is allow-listed (e.g. the VPN enrollment
+			// bootstrap surface) — its gate still runs downstream in authWrap.
+			if r.RequireGroup == "" || opts.PublicOnlyAllowHosts[r.Match.Host] {
 				kept = append(kept, r)
 			}
 		}
