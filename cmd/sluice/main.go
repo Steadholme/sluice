@@ -19,6 +19,7 @@ import (
 	"github.com/holdfast/sluice/internal/gateway"
 	"github.com/holdfast/sluice/internal/mtls"
 	"github.com/holdfast/sluice/internal/oidc"
+	"github.com/holdfast/sluice/internal/rbac"
 	"github.com/holdfast/sluice/internal/store"
 	"github.com/holdfast/sluice/internal/waf"
 )
@@ -114,6 +115,17 @@ func main() {
 	})
 	defer wafEngine.Close()
 
+	// Verdict-backed RBAC authorizer (env-toggled by RBAC_ENABLED). Off/unconfigured
+	// is a no-op: a route's require_group is ignored and every sso route stays plain
+	// SSO. When on, group-gated sso routes consult Verdict over the internal network
+	// (VERDICT_URL) with the service token; a cold-cache Verdict outage fails closed.
+	authz := rbac.New(rbac.Config{
+		Enabled:    cfg.RBACEnabled,
+		VerdictURL: cfg.VerdictURL,
+		Token:      cfg.VerdictServiceToken,
+		Log:        log,
+	})
+
 	// In acme mode the autocert HostPolicy is the live route hosts ∪ the apex ∪ the
 	// legacy ACME_DOMAIN, so we hand serve() the same route store to read from.
 	acmeHosts := gateway.RouteHostSet(routeStore, cfg.ACMEDomain, apexHost(cfg))
@@ -124,6 +136,9 @@ func main() {
 		Transport: mtlsTransport,
 		Auditor:   auditor,
 		WAF:       wafEngine,
+		Authz:     authz,
+		PublicOnly: cfg.PublicOnly,
+		GatewayHMACKey: cfg.GatewayHMACKey,
 	})
 
 	log.Info("sluice listening",
@@ -135,6 +150,8 @@ func main() {
 		"oidc_sso", provider != nil,
 		"audit", cfg.AuditEnabled,
 		"waf", cfg.WAFEnabled,
+		"rbac", authz.Enabled(),
+		"public_only", cfg.PublicOnly,
 	)
 	if err := serve(log, cfg, srv.Handler(), acmeHosts); err != nil {
 		log.Error("server stopped", "error", err)

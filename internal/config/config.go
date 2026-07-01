@@ -126,6 +126,24 @@ const (
 	EnvAuditIngestToken = "AUDIT_INGEST_TOKEN" // bearer credential for POST /events
 )
 
+// RBAC (Verdict-backed per-route group gating) environment variables. All
+// optional; RBAC_ENABLED defaults OFF so an `auth=sso` route's require_group is a
+// no-op until both the flag and Verdict wiring are set.
+const (
+	EnvRBACEnabled          = "RBAC_ENABLED"          // on|off — enable per-route group gating (default off)
+	EnvVerdictURL           = "VERDICT_URL"           // Verdict base URL, e.g. http://verdict:9140
+	EnvVerdictServiceToken  = "VERDICT_SERVICE_TOKEN" // bearer credential for Verdict /api/*
+	EnvGatewayHMACKey       = "GATEWAY_HMAC_KEY"      // HMAC key binding injected identity into X-Auth-Sig
+)
+
+// EnvPublicOnly, when on, makes this Sluice instance a PUBLIC-facing gateway that
+// serves ONLY non-internal routes: any route carrying a require_group (the mgmt
+// consoles) is treated as nonexistent (404). A companion INTERNAL instance runs
+// with PUBLIC_ONLY off (serves all routes) bound to the VPN interface, so the mgmt
+// consoles are reachable only over the VPN. Default off = serve every route
+// (single-gateway behavior, unchanged).
+const EnvPublicOnly = "PUBLIC_ONLY"
+
 // WAF (Aegis inline WAF + rate limiter) environment variables. All optional;
 // WAF_ENABLED defaults OFF so the public ingress keeps its exact current
 // behavior. Even when enabled the WAF only engages on routes opted in with
@@ -187,6 +205,13 @@ type Route struct {
 	// route is explicitly flagged AND WAF_ENABLED is on. This keeps the public
 	// ingress behavior identical until both switches are set.
 	Waf bool `json:"waf,omitempty"`
+
+	// RequireGroup, when non-empty on an `auth=sso` route, gates the route behind
+	// membership of that group (decided by Verdict). OPTIONAL and default empty: an
+	// absent field (or a pre-existing route row) parses to "", so the route stays
+	// plain SSO (any authenticated user) until it is explicitly set AND RBAC_ENABLED
+	// is on — keeping the ingress behavior identical.
+	RequireGroup string `json:"require_group,omitempty"`
 
 	// upstreamURL is the parsed form of Upstream, populated by Validate so the
 	// data path never re-parses on the hot path. Unexported so it is not part
@@ -251,6 +276,22 @@ type Config struct {
 	AuditEnabled     bool   `json:"audit_enabled"`
 	WatchtowerURL    string `json:"watchtower_url"`
 	AuditIngestToken string `json:"audit_ingest_token"`
+
+	// RBAC (Verdict-backed group gating). Off by default (RBACEnabled=false) so a
+	// route's require_group is ignored and every sso route is plain SSO. When on,
+	// group-gated routes consult VerdictURL with VerdictServiceToken.
+	RBACEnabled         bool   `json:"rbac_enabled"`
+	VerdictURL          string `json:"verdict_url"`
+	VerdictServiceToken string `json:"verdict_service_token"`
+
+	// GatewayHMACKey, when set, makes the proxy sign the injected identity into
+	// X-Auth-Sig (HMAC over subject+groups+minute) so backends can prove it came
+	// from Sluice. Empty = no signature (backward compatible).
+	GatewayHMACKey string `json:"gateway_hmac_key"`
+
+	// PublicOnly makes this instance drop internal (require_group) routes -> 404,
+	// so the public gateway does not expose the mgmt consoles. Default false.
+	PublicOnly bool `json:"public_only"`
 
 	// WAF (Aegis). Off by default (WAFEnabled=false) so the gateway is a pure
 	// pass-through and the public ingress is unchanged. When on, only routes with
@@ -423,6 +464,23 @@ func (c *Config) ApplyEnv() {
 	}
 	if v := os.Getenv(EnvAuditIngestToken); v != "" {
 		c.AuditIngestToken = v
+	}
+
+	// RBAC overrides.
+	if v := os.Getenv(EnvRBACEnabled); v != "" {
+		c.RBACEnabled = envOn(v)
+	}
+	if v := os.Getenv(EnvVerdictURL); v != "" {
+		c.VerdictURL = v
+	}
+	if v := os.Getenv(EnvVerdictServiceToken); v != "" {
+		c.VerdictServiceToken = v
+	}
+	if v := os.Getenv(EnvGatewayHMACKey); v != "" {
+		c.GatewayHMACKey = v
+	}
+	if v := os.Getenv(EnvPublicOnly); v != "" {
+		c.PublicOnly = envOn(v)
 	}
 
 	// WAF overrides. A malformed numeric/duration value is treated as unset so

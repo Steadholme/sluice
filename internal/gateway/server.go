@@ -9,6 +9,7 @@ import (
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
 	"github.com/holdfast/sluice/internal/oidc"
+	"github.com/holdfast/sluice/internal/rbac"
 	"github.com/holdfast/sluice/internal/store"
 	"github.com/holdfast/sluice/internal/waf"
 )
@@ -38,6 +39,17 @@ type Options struct {
 	Transport *http.Transport
 	Auditor   *audit.Emitter
 	WAF       *waf.Engine
+	// Authz is the optional Verdict-backed RBAC authorizer. When nil or disabled,
+	// per-route require_group gating is a no-op (nil-safe via Enabled()).
+	Authz *rbac.Authorizer
+	// PublicOnly, when true, builds a PUBLIC-facing gateway that omits every
+	// internal (require_group) route — the router never matches them, so they 404.
+	// The companion internal instance runs with PublicOnly=false (serves all) bound
+	// to the VPN interface. Default false = serve every route.
+	PublicOnly bool
+	// GatewayHMACKey, when non-empty, HMAC-signs the injected identity into X-Auth-Sig
+	// so backends can verify Sluice minted it. Empty = no signature (backward compatible).
+	GatewayHMACKey string
 }
 
 // Server is the assembled Sluice HTTP handler: /healthz, the gateway-owned
@@ -55,13 +67,28 @@ type Server struct {
 // RouteStore would rebuild this map on change (the FusionDB/CDC seam), leaving
 // request handling untouched.
 func NewServer(s store.RouteStore, opts Options) *Server {
+	routes := s.Routes()
+	if opts.PublicOnly {
+		// Public gateway: drop internal (require_group) routes so the router never
+		// matches them (they 404) — the mgmt consoles live only on the internal
+		// instance. autocert HostPolicy is computed separately from the FULL store
+		// in main.go, so the public instance still issues/renews their certs.
+		kept := make([]config.Route, 0, len(routes))
+		for _, r := range routes {
+			if r.RequireGroup == "" {
+				kept = append(kept, r)
+			}
+		}
+		routes = kept
+		s = store.NewStaticStore(routes)
+	}
 	srv := &Server{
 		router:   NewRouter(s),
 		provider: opts.Provider,
 		handlers: make(map[string]routeHandler),
 	}
-	for _, route := range s.Routes() {
-		proxy := newReverseProxy(route, opts.Transport)
+	for _, route := range routes {
+		proxy := newReverseProxy(route, opts.Transport, opts.GatewayHMACKey)
 		// Auth wraps the proxy; the WAF (when enabled AND this route opted in)
 		// wraps the auth handler so malicious traffic is rejected before auth runs.
 		// opts.WAF is nil when WAF_ENABLED is off, and Middleware is a pass-through
@@ -91,7 +118,15 @@ func authWrap(route config.Route, proxy http.Handler, opts Options) http.Handler
 				http.Error(w, "sso auth not configured", http.StatusServiceUnavailable)
 			})
 		}
-		return opts.Provider.Middleware(proxy)
+		// Optional RBAC: an sso route that names a required group is wrapped with
+		// the Verdict-backed gate, which runs AFTER the SSO middleware establishes
+		// identity. When the authorizer is disabled/unconfigured or the route names
+		// no group, inner stays the bare proxy (byte-identical behavior).
+		inner := proxy
+		if route.RequireGroup != "" && opts.Authz.Enabled() {
+			inner = opts.Authz.Gate(route.RequireGroup, proxy)
+		}
+		return opts.Provider.Middleware(inner)
 	default: // config.AuthPublic
 		return proxy
 	}

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"time"
 
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
@@ -34,7 +35,7 @@ const authHeaderPrefix = "X-Auth-"
 // When mtls is non-nil and the upstream is https (the internal Keystone hop under
 // INTERNAL_MTLS=on), the proxy uses the mTLS transport so it presents the Keyward
 // client certificate; plain-http upstreams keep the default transport unchanged.
-func newReverseProxy(route config.Route, mtls *http.Transport) *httputil.ReverseProxy {
+func newReverseProxy(route config.Route, mtls *http.Transport, hmacKey string) *httputil.ReverseProxy {
 	target := route.UpstreamURL()
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -49,10 +50,20 @@ func newReverseProxy(route config.Route, mtls *http.Transport) *httputil.Reverse
 
 			stripAuthHeaders(pr.Out.Header)
 			if id, ok := auth.IdentityFromContext(pr.In.Context()); ok {
+				groups := strings.Join(id.Groups, ",")
 				pr.Out.Header.Set(auth.HeaderAuthSubject, id.Subject)
 				pr.Out.Header.Set(auth.HeaderAuthScope, id.Scope)
 				if id.Email != "" {
 					pr.Out.Header.Set(auth.HeaderAuthEmail, id.Email)
+				}
+				if len(id.Groups) > 0 {
+					pr.Out.Header.Set(auth.HeaderAuthGroups, groups)
+				}
+				// Cryptographically bind subject+groups to a 1-minute window so a backend
+				// sharing GATEWAY_HMAC_KEY can prove Sluice minted this identity. Key unset
+				// => "" => header omitted, so behavior is unchanged until the key is set.
+				if sig := auth.SignIdentity(hmacKey, id.Subject, groups, time.Now().Unix()); sig != "" {
+					pr.Out.Header.Set(auth.HeaderAuthSig, sig)
 				}
 			}
 		},

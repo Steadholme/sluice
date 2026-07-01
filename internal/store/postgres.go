@@ -22,8 +22,9 @@ CREATE TABLE IF NOT EXISTS routes (
     path_prefix TEXT    NOT NULL,
     upstream    TEXT    NOT NULL,
     protected   BOOLEAN NOT NULL DEFAULT FALSE,
-    auth        TEXT    NOT NULL DEFAULT '',
-    waf         BOOLEAN NOT NULL DEFAULT FALSE
+    auth          TEXT    NOT NULL DEFAULT '',
+    waf           BOOLEAN NOT NULL DEFAULT FALSE,
+    require_group TEXT    NOT NULL DEFAULT ''
 )`
 
 // addAuthColumnDDL backfills the auth column on a pre-existing routes table (one
@@ -39,12 +40,17 @@ const addAuthColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS auth TEXT 
 // unchanged.
 const addWafColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS waf BOOLEAN NOT NULL DEFAULT FALSE`
 
+// addRequireGroupColumnDDL backfills the RBAC require_group column the same way.
+// Idempotent; existing rows default to '' so no route is group-gated until it is
+// explicitly set, keeping behavior unchanged.
+const addRequireGroupColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS require_group TEXT NOT NULL DEFAULT ''`
+
 const (
 	countRoutesSQL = `SELECT count(*) FROM routes`
-	upsertRouteSQL = `INSERT INTO routes (name, host, path_prefix, upstream, protected, auth, waf)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+	upsertRouteSQL = `INSERT INTO routes (name, host, path_prefix, upstream, protected, auth, waf, require_group)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (name) DO NOTHING`
-	selectRoutesSQL = `SELECT name, host, path_prefix, upstream, protected, auth, waf
+	selectRoutesSQL = `SELECT name, host, path_prefix, upstream, protected, auth, waf, require_group
 FROM routes ORDER BY name`
 )
 
@@ -112,6 +118,9 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	if _, err := s.pool.Exec(ctx, addWafColumnDDL); err != nil {
 		return fmt.Errorf("store: add waf column: %w", err)
 	}
+	if _, err := s.pool.Exec(ctx, addRequireGroupColumnDDL); err != nil {
+		return fmt.Errorf("store: add require_group column: %w", err)
+	}
 	return nil
 }
 
@@ -127,7 +136,7 @@ func (s *PostgresStore) seedIfEmpty(ctx context.Context, seed []config.Route) er
 	}
 	batch := &pgx.Batch{}
 	for _, r := range seed {
-		batch.Queue(upsertRouteSQL, r.Name, r.Match.Host, r.Match.PathPrefix, r.Upstream, r.Protected, r.Auth, r.Waf)
+		batch.Queue(upsertRouteSQL, r.Name, r.Match.Host, r.Match.PathPrefix, r.Upstream, r.Protected, r.Auth, r.Waf, r.RequireGroup)
 	}
 	br := s.pool.SendBatch(ctx, batch)
 	defer br.Close()
@@ -152,7 +161,7 @@ func (s *PostgresStore) load(ctx context.Context) error {
 	var loaded []config.Route
 	for rows.Next() {
 		var r config.Route
-		if err := rows.Scan(&r.Name, &r.Match.Host, &r.Match.PathPrefix, &r.Upstream, &r.Protected, &r.Auth, &r.Waf); err != nil {
+		if err := rows.Scan(&r.Name, &r.Match.Host, &r.Match.PathPrefix, &r.Upstream, &r.Protected, &r.Auth, &r.Waf, &r.RequireGroup); err != nil {
 			return fmt.Errorf("store: scan route: %w", err)
 		}
 		loaded = append(loaded, r)

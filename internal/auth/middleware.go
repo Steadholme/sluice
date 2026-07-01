@@ -22,6 +22,10 @@ const (
 	HeaderAuthSubject = "X-Auth-Subject"
 	HeaderAuthScope   = "X-Auth-Scope"
 	HeaderAuthEmail   = "X-Auth-Email"
+	// HeaderAuthGroups carries the caller's group memberships (comma-separated)
+	// for group-gated (RBAC) routes; empty/absent when the route has no
+	// require_group or RBAC is disabled.
+	HeaderAuthGroups = "X-Auth-Groups"
 )
 
 // Identity is the verified caller identity established by the bearer Middleware
@@ -32,6 +36,9 @@ type Identity struct {
 	Subject string
 	Email   string
 	Scope   string
+	// Groups is populated by the RBAC gate (from Verdict) on group-gated routes
+	// and injected as X-Auth-Groups upstream. Nil/empty otherwise.
+	Groups []string
 }
 
 // IdentityFromContext returns the verified Identity stored on the request.
