@@ -55,6 +55,9 @@ type Options struct {
 	// GatewayHMACKey, when non-empty, HMAC-signs the injected identity into X-Auth-Sig
 	// so backends can verify Sluice minted it. Empty = no signature (backward compatible).
 	GatewayHMACKey string
+	// GatewayZone is injected into X-Gateway-Zone on every forwarded request.
+	// Empty defaults to external.
+	GatewayZone string
 }
 
 // Server is the assembled Sluice HTTP handler: /healthz, the gateway-owned
@@ -73,6 +76,12 @@ type Server struct {
 // request handling untouched.
 func NewServer(s store.RouteStore, opts Options) *Server {
 	routes := s.Routes()
+	gatewayZone := strings.ToLower(strings.TrimSpace(opts.GatewayZone))
+	switch gatewayZone {
+	case config.GatewayZoneExternal, config.GatewayZoneInternal:
+	default:
+		gatewayZone = config.DefaultGatewayZone
+	}
 	if opts.PublicOnly {
 		// Public gateway: drop internal (require_group) routes so the router never
 		// matches them (they 404) — the mgmt consoles live only on the internal
@@ -96,7 +105,7 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 		handlers: make(map[string]routeHandler),
 	}
 	for _, route := range routes {
-		proxy := newReverseProxy(route, opts.Transport, opts.GatewayHMACKey)
+		proxy := newReverseProxy(route, opts.Transport, opts.GatewayHMACKey, gatewayZone)
 		// Auth wraps the proxy; the WAF (when enabled AND this route opted in)
 		// wraps the auth handler so malicious traffic is rejected before auth runs.
 		// opts.WAF is nil when WAF_ENABLED is off, and Middleware is a pass-through

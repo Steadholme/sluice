@@ -42,6 +42,13 @@ const (
 	discoverySuffix = "/.well-known/openid-configuration"
 )
 
+// Gateway zone values injected into X-Gateway-Zone for downstream services.
+const (
+	GatewayZoneExternal = "external"
+	GatewayZoneInternal = "internal"
+	DefaultGatewayZone  = GatewayZoneExternal
+)
+
 // Environment variable names that override the dev-contract defaults. They are
 // applied by ApplyEnv before Validate, so an unset variable keeps the file/built
 // in default unchanged.
@@ -134,6 +141,7 @@ const (
 	EnvVerdictURL          = "VERDICT_URL"           // Verdict base URL, e.g. http://verdict:9140
 	EnvVerdictServiceToken = "VERDICT_SERVICE_TOKEN" // bearer credential for Verdict /api/*
 	EnvGatewayHMACKey      = "GATEWAY_HMAC_KEY"      // HMAC key binding injected identity into X-Auth-Sig
+	EnvGatewayZone         = "GATEWAY_ZONE"          // internal|external zone injected into X-Gateway-Zone
 )
 
 // EnvPublicOnly, when on, makes this Sluice instance a PUBLIC-facing gateway that
@@ -296,6 +304,9 @@ type Config struct {
 	// X-Auth-Sig (HMAC over subject+groups+minute) so backends can prove it came
 	// from Sluice. Empty = no signature (backward compatible).
 	GatewayHMACKey string `json:"gateway_hmac_key"`
+	// GatewayZone is injected into X-Gateway-Zone on every forwarded request.
+	// Empty defaults to "external" so an unset public gateway never claims internal.
+	GatewayZone string `json:"gateway_zone"`
 
 	// PublicOnly makes this instance drop internal (require_group) routes -> 404,
 	// so the public gateway does not expose the mgmt consoles. Default false.
@@ -490,6 +501,9 @@ func (c *Config) ApplyEnv() {
 	if v := os.Getenv(EnvGatewayHMACKey); v != "" {
 		c.GatewayHMACKey = v
 	}
+	if v := os.Getenv(EnvGatewayZone); v != "" {
+		c.GatewayZone = v
+	}
 	if v := os.Getenv(EnvPublicOnly); v != "" {
 		c.PublicOnly = envOn(v)
 	}
@@ -578,6 +592,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	c.applyGatewayDefaults()
+	if err := c.normalizeGatewayZone(); err != nil {
+		return err
+	}
 	c.applyWAFDefaults()
 
 	if len(c.Routes) == 0 {
@@ -683,6 +700,21 @@ func (c *Config) applyGatewayDefaults() {
 	}
 	if c.KeystoneTLSServerName == "" {
 		c.KeystoneTLSServerName = "keystone"
+	}
+}
+
+// normalizeGatewayZone keeps the injected trust header on the fixed contract:
+// external by default, and only external/internal when configured.
+func (c *Config) normalizeGatewayZone() error {
+	c.GatewayZone = strings.ToLower(strings.TrimSpace(c.GatewayZone))
+	if c.GatewayZone == "" {
+		c.GatewayZone = DefaultGatewayZone
+	}
+	switch c.GatewayZone {
+	case GatewayZoneExternal, GatewayZoneInternal:
+		return nil
+	default:
+		return fmt.Errorf("invalid gateway_zone %q (want %s|%s)", c.GatewayZone, GatewayZoneExternal, GatewayZoneInternal)
 	}
 }
 

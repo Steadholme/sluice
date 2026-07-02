@@ -10,10 +10,15 @@ import (
 	"github.com/holdfast/sluice/internal/config"
 )
 
-// authHeaderPrefix guards the X-Auth-* family. The proxy is the single trusted
-// writer of these headers: it strips any client-supplied value and re-injects
-// only the verified identity from the request context.
-const authHeaderPrefix = "X-Auth-"
+const (
+	// authHeaderPrefix guards the X-Auth-* family. The proxy is the single trusted
+	// writer of these headers: it strips any client-supplied value and re-injects
+	// only the verified identity from the request context.
+	authHeaderPrefix = "X-Auth-"
+	// gatewayZoneHeader is minted by Sluice for downstream trust decisions. Clients
+	// cannot supply it because every proxied request strips and replaces the value.
+	gatewayZoneHeader = "X-Gateway-Zone"
+)
 
 // newReverseProxy builds a streaming reverse proxy for a single route.
 //
@@ -26,6 +31,8 @@ const authHeaderPrefix = "X-Auth-"
 //   - PRESERVES the inbound Host header toward the upstream (instead of rewriting
 //     it to the upstream's host) so a fronted Keystone sees the public host
 //     (id.w33d.xyz) and builds correct absolute OIDC URLs;
+//   - strips every client-supplied X-Gateway-Zone header, then injects the
+//     configured gateway zone.
 //   - strips every client-supplied X-Auth-* header, then injects the verified
 //     X-Auth-Subject / X-Auth-Scope from the auth context when present.
 //
@@ -35,7 +42,7 @@ const authHeaderPrefix = "X-Auth-"
 // When mtls is non-nil and the upstream is https (the internal Keystone hop under
 // INTERNAL_MTLS=on), the proxy uses the mTLS transport so it presents the Keyward
 // client certificate; plain-http upstreams keep the default transport unchanged.
-func newReverseProxy(route config.Route, mtls *http.Transport, hmacKey string) *httputil.ReverseProxy {
+func newReverseProxy(route config.Route, mtls *http.Transport, hmacKey, gatewayZone string) *httputil.ReverseProxy {
 	target := route.UpstreamURL()
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -47,6 +54,9 @@ func newReverseProxy(route config.Route, mtls *http.Transport, hmacKey string) *
 			// URLs. X-Forwarded-Host still carries the same value for apps that
 			// prefer it.
 			pr.Out.Host = pr.In.Host
+
+			pr.Out.Header.Del(gatewayZoneHeader)
+			pr.Out.Header.Set(gatewayZoneHeader, gatewayZone)
 
 			stripAuthHeaders(pr.Out.Header)
 			if id, ok := auth.IdentityFromContext(pr.In.Context()); ok {

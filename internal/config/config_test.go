@@ -327,6 +327,8 @@ func TestApplyEnvAuditOverrides(t *testing.T) {
 }
 
 func TestGatewayDefaults(t *testing.T) {
+	t.Setenv(EnvGatewayZone, "")
+
 	c := minimalValid()
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
@@ -342,6 +344,22 @@ func TestGatewayDefaults(t *testing.T) {
 	}
 	if c.GWOIDCEnabled || c.InternalMTLS {
 		t.Error("OIDC/mTLS must default OFF")
+	}
+	if c.GatewayZone != DefaultGatewayZone {
+		t.Errorf("GatewayZone = %q, want default %q", c.GatewayZone, DefaultGatewayZone)
+	}
+}
+
+func TestApplyEnvGatewayZoneOverride(t *testing.T) {
+	t.Setenv(EnvGatewayZone, GatewayZoneInternal)
+
+	c := minimalValid()
+	c.ApplyEnv()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if c.GatewayZone != GatewayZoneInternal {
+		t.Errorf("GatewayZone = %q, want %q", c.GatewayZone, GatewayZoneInternal)
 	}
 }
 

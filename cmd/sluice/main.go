@@ -140,6 +140,7 @@ func main() {
 		PublicOnly:           cfg.PublicOnly,
 		PublicOnlyAllowHosts: hostSet(cfg.PublicOnlyAllow),
 		GatewayHMACKey:       cfg.GatewayHMACKey,
+		GatewayZone:          cfg.GatewayZone,
 	})
 
 	log.Info("sluice listening",
@@ -153,6 +154,7 @@ func main() {
 		"waf", cfg.WAFEnabled,
 		"rbac", authz.Enabled(),
 		"public_only", cfg.PublicOnly,
+		"gateway_zone", cfg.GatewayZone,
 	)
 	if err := serve(log, cfg, srv.Handler(), acmeHosts); err != nil {
 		log.Error("server stopped", "error", err)
