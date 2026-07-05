@@ -42,7 +42,7 @@ const (
 // When mtls is non-nil and the upstream is https (the internal Keystone hop under
 // INTERNAL_MTLS=on), the proxy uses the mTLS transport so it presents the Keyward
 // client certificate; plain-http upstreams keep the default transport unchanged.
-func newReverseProxy(route config.Route, mtls *http.Transport, hmacKey, gatewayZone string) *httputil.ReverseProxy {
+func newReverseProxy(route config.Route, mtls *http.Transport, hmacKey, gatewayZone, sessionCookie string) *httputil.ReverseProxy {
 	target := route.UpstreamURL()
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -59,6 +59,16 @@ func newReverseProxy(route config.Route, mtls *http.Transport, hmacKey, gatewayZ
 			pr.Out.Header.Set(gatewayZoneHeader, gatewayZone)
 
 			stripAuthHeaders(pr.Out.Header)
+			// Non-SSO routes are untrusted from the estate's point of view — most
+			// importantly the public SiteFlow-deployed sites served on *.w33d.xyz,
+			// which run arbitrary repo-owner code (incl. serverless functions). The
+			// browser attaches the Domain=.w33d.xyz session cookie to those same-
+			// registrable-domain hosts, so strip it here: a deployed function must
+			// never see (and thus never be able to exfiltrate) the estate SSO
+			// session. SSO routes are trusted estate services and keep it.
+			if route.Auth != config.AuthSSO {
+				stripCookie(pr.Out.Header, sessionCookie)
+			}
 			if id, ok := auth.IdentityFromContext(pr.In.Context()); ok {
 				groups := strings.Join(id.Groups, ",")
 				pr.Out.Header.Set(auth.HeaderAuthSubject, id.Subject)
@@ -91,4 +101,38 @@ func stripAuthHeaders(h http.Header) {
 			delete(h, k)
 		}
 	}
+}
+
+// stripCookie surgically removes a single named cookie from the request Cookie
+// header, preserving every other cookie (so a deployed site keeps its own
+// cookies while the estate session cookie is dropped). A no-op when name is
+// empty or the header carries no such cookie; the header is deleted entirely
+// when nothing remains.
+func stripCookie(h http.Header, name string) {
+	if name == "" {
+		return
+	}
+	const cookieHeader = "Cookie"
+	raw := h.Get(cookieHeader)
+	if raw == "" {
+		return
+	}
+	parts := strings.Split(raw, ";")
+	kept := parts[:0]
+	for _, p := range parts {
+		c := strings.TrimSpace(p)
+		if c == "" {
+			continue
+		}
+		// A cookie name is everything up to the first '=' (RFC 6265 cookie-pair).
+		if eq := strings.IndexByte(c, '='); eq >= 0 && c[:eq] == name {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	if len(kept) == 0 {
+		h.Del(cookieHeader)
+		return
+	}
+	h.Set(cookieHeader, strings.Join(kept, "; "))
 }

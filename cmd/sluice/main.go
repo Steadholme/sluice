@@ -130,7 +130,7 @@ func main() {
 	// legacy ACME_DOMAIN, so we hand serve() the same route store to read from.
 	acmeHosts := gateway.RouteHostSet(routeStore, cfg.ACMEDomain, apexHost(cfg))
 
-	srv := gateway.NewServer(routeStore, gateway.Options{
+	opts := gateway.Options{
 		Verifier:             verifier,
 		Provider:             provider,
 		Transport:            mtlsTransport,
@@ -141,7 +141,15 @@ func main() {
 		PublicOnlyAllowHosts: hostSet(cfg.PublicOnlyAllow),
 		GatewayHMACKey:       cfg.GatewayHMACKey,
 		GatewayZone:          cfg.GatewayZone,
-	})
+		SessionCookieName:    oidc.DefaultCookieName,
+	}
+	// Rebuild the request handler from the (hot-reloading) route store whenever
+	// the route set changes, so DB route edits — e.g. a new SiteFlow deployment
+	// host inserted by the gateway-sync reconciler — take effect without a
+	// restart. This applies on the PublicOnly public instance too: each rebuild
+	// re-runs NewServer's PublicOnly route filter against the fresh snapshot.
+	buildHandler := func() http.Handler { return gateway.NewServer(routeStore, opts).Handler() }
+	handler := gateway.NewReloadableHandler(context.Background(), routeStore, buildHandler, 20*time.Second, log)
 
 	log.Info("sluice listening",
 		"tls_mode", cfg.TLSMode,
@@ -156,7 +164,7 @@ func main() {
 		"public_only", cfg.PublicOnly,
 		"gateway_zone", cfg.GatewayZone,
 	)
-	if err := serve(log, cfg, srv.Handler(), acmeHosts); err != nil {
+	if err := serve(log, cfg, handler, acmeHosts); err != nil {
 		log.Error("server stopped", "error", err)
 		os.Exit(1)
 	}

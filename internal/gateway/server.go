@@ -58,6 +58,11 @@ type Options struct {
 	// GatewayZone is injected into X-Gateway-Zone on every forwarded request.
 	// Empty defaults to external.
 	GatewayZone string
+	// SessionCookieName is the estate SSO session cookie (e.g. __Secure-gw) that
+	// the proxy strips from requests to non-SSO (untrusted/public) upstreams, so
+	// an untrusted deployed site under *.w33d.xyz can never read it. Empty = no
+	// cookie stripping (backward compatible).
+	SessionCookieName string
 }
 
 // Server is the assembled Sluice HTTP handler: /healthz, the gateway-owned
@@ -105,7 +110,7 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 		handlers: make(map[string]routeHandler),
 	}
 	for _, route := range routes {
-		proxy := newReverseProxy(route, opts.Transport, opts.GatewayHMACKey, gatewayZone)
+		proxy := newReverseProxy(route, opts.Transport, opts.GatewayHMACKey, gatewayZone, opts.SessionCookieName)
 		// Auth wraps the proxy; the WAF (when enabled AND this route opted in)
 		// wraps the auth handler so malicious traffic is rejected before auth runs.
 		// opts.WAF is nil when WAF_ENABLED is off, and Middleware is a pass-through
