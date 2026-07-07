@@ -49,6 +49,7 @@ const (
 	GatewayPrefix = "/_gw/"
 	CallbackPath  = "/_gw/auth/callback"
 	LogoutPath    = "/_gw/auth/logout"
+	LangPath      = "/_gw/lang"
 
 	// DefaultCookieName uses the __Secure- prefix (NOT __Host-): __Secure- still
 	// REQUIRES Secure + HTTPS but — unlike __Host- — PERMITS a Domain attribute, so
@@ -56,6 +57,7 @@ const (
 	// cross-subdomain SSO. Host-locking is intentionally traded for one session
 	// across every *.w33d.xyz service.
 	DefaultCookieName = "__Secure-gw"
+	LangCookieName    = "__Secure-lang"
 
 	// DefaultCookieDomain scopes the session cookie to the parent registrable
 	// domain so one gateway login is sent to every subdomain. A leading dot is the
@@ -69,6 +71,9 @@ const (
 
 	// requestedScope is the fixed scope set the gateway asks for.
 	requestedScope = "openid email profile"
+
+	// langCookieMaxAge is roughly one year.
+	langCookieMaxAge = 365 * 24 * 60 * 60
 )
 
 // Config is the relying-party configuration. Issuer + the derived authorize URL
@@ -194,6 +199,8 @@ func (p *Provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleCallback(w, r)
 	case LogoutPath:
 		p.handleLogout(w, r)
+	case LangPath:
+		p.handleLang(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -366,6 +373,39 @@ func (p *Provider) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
+// handleLang sets the estate-wide display locale cookie and redirects back to a
+// validated same-domain return target.
+func (p *Provider) handleLang(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if to := r.URL.Query().Get("to"); validLang(to) {
+		p.setLangCookie(w, to, langCookieMaxAge)
+	}
+	http.Redirect(w, r, p.langReturn(r), http.StatusFound)
+}
+
+func validLang(code string) bool {
+	switch code {
+	case "en", "zh", "ja":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Provider) langReturn(r *http.Request) string {
+	q := r.URL.Query()
+	if _, ok := q["return"]; ok {
+		return p.safeReturn(q.Get("return"))
+	}
+	if ref := r.Header.Get("Referer"); ref != "" {
+		return p.safeReturn(ref)
+	}
+	return "/"
+}
+
 // auditDeny emits an sso.session.deny with a short, safe reason. The actor is
 // anonymous because a failed callback never established an identity, and detail
 // never carries token/code/secret material.
@@ -462,6 +502,20 @@ func (p *Provider) validateIDToken(ctx context.Context, raw, wantNonce string) (
 func (p *Provider) setCookie(w http.ResponseWriter, value string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     p.cfg.CookieName,
+		Value:    value,
+		Path:     "/",
+		Domain:   p.cfg.CookieDomain,
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	})
+}
+
+// __Secure-lang is display-only and deliberately outside the gateway HMAC signature.
+func (p *Provider) setLangCookie(w http.ResponseWriter, value string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     LangCookieName,
 		Value:    value,
 		Path:     "/",
 		Domain:   p.cfg.CookieDomain,
