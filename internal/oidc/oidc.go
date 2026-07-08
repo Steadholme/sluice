@@ -50,6 +50,7 @@ const (
 	CallbackPath  = "/_gw/auth/callback"
 	LogoutPath    = "/_gw/auth/logout"
 	LangPath      = "/_gw/lang"
+	ThemePath     = "/_gw/theme"
 
 	// DefaultCookieName uses the __Secure- prefix (NOT __Host-): __Secure- still
 	// REQUIRES Secure + HTTPS but — unlike __Host- — PERMITS a Domain attribute, so
@@ -58,6 +59,7 @@ const (
 	// across every *.w33d.xyz service.
 	DefaultCookieName = "__Secure-gw"
 	LangCookieName    = "__Secure-lang"
+	ThemeCookieName   = "__Secure-theme"
 
 	// DefaultCookieDomain scopes the session cookie to the parent registrable
 	// domain so one gateway login is sent to every subdomain. A leading dot is the
@@ -201,6 +203,8 @@ func (p *Provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleLogout(w, r)
 	case LangPath:
 		p.handleLang(w, r)
+	case ThemePath:
+		p.handleTheme(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -386,9 +390,31 @@ func (p *Provider) handleLang(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, p.langReturn(r), http.StatusFound)
 }
 
+// handleTheme sets the estate-wide display theme cookie and redirects back to a
+// validated same-domain return target.
+func (p *Provider) handleTheme(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if to := r.URL.Query().Get("to"); validTheme(to) {
+		p.setThemeCookie(w, to, langCookieMaxAge)
+	}
+	http.Redirect(w, r, p.langReturn(r), http.StatusFound)
+}
+
 func validLang(code string) bool {
 	switch code {
 	case "en", "zh", "ja":
+		return true
+	default:
+		return false
+	}
+}
+
+func validTheme(code string) bool {
+	switch code {
+	case "light", "dark", "auto":
 		return true
 	default:
 		return false
@@ -516,6 +542,20 @@ func (p *Provider) setCookie(w http.ResponseWriter, value string, maxAge int) {
 func (p *Provider) setLangCookie(w http.ResponseWriter, value string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     LangCookieName,
+		Value:    value,
+		Path:     "/",
+		Domain:   p.cfg.CookieDomain,
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	})
+}
+
+// __Secure-theme is display-only and deliberately outside the gateway HMAC signature.
+func (p *Provider) setThemeCookie(w http.ResponseWriter, value string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     ThemeCookieName,
 		Value:    value,
 		Path:     "/",
 		Domain:   p.cfg.CookieDomain,

@@ -511,6 +511,82 @@ func TestLangHandlerIgnoresInvalidLocale(t *testing.T) {
 	}
 }
 
+func TestThemeHandlerSetsCookieAndRedirectsSafely(t *testing.T) {
+	p := &Provider{cfg: Config{CookieDomain: ".w33d.xyz"}}
+	cases := []struct {
+		name      string
+		target    string
+		referer   string
+		wantLoc   string
+		wantValue string
+	}{
+		{
+			name:      "trusted return parameter",
+			target:    "https://id.w33d.xyz" + ThemePath + "?to=dark&return=" + url.QueryEscape("https://people.w33d.xyz/u/u_alice?tab=profile"),
+			wantLoc:   "https://people.w33d.xyz/u/u_alice?tab=profile",
+			wantValue: "dark",
+		},
+		{
+			name:      "referer fallback is sanitized",
+			target:    "https://id.w33d.xyz" + ThemePath + "?to=auto",
+			referer:   "https://evil.com/phish?x=1",
+			wantLoc:   "/phish?x=1",
+			wantValue: "auto",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			if tc.referer != "" {
+				req.Header.Set("Referer", tc.referer)
+			}
+			rec := httptest.NewRecorder()
+			p.ServeHTTP(rec, req)
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusFound {
+				t.Fatalf("status = %d, want 302", resp.StatusCode)
+			}
+			if got := resp.Header.Get("Location"); got != tc.wantLoc {
+				t.Fatalf("Location = %q, want %q", got, tc.wantLoc)
+			}
+			c := findCookie(resp.Cookies(), ThemeCookieName)
+			if c == nil {
+				t.Fatalf("missing %s Set-Cookie", ThemeCookieName)
+			}
+			if c.Value != tc.wantValue {
+				t.Errorf("cookie value = %q, want %q", c.Value, tc.wantValue)
+			}
+			if c.Domain != "w33d.xyz" || c.Path != "/" || !c.Secure || !c.HttpOnly ||
+				c.SameSite != http.SameSiteLaxMode || c.MaxAge != langCookieMaxAge {
+				t.Errorf("cookie attributes = %#v, want __Secure-gw shape", c)
+			}
+		})
+	}
+}
+
+func TestThemeHandlerIgnoresInvalidTheme(t *testing.T) {
+	p := &Provider{cfg: Config{CookieDomain: ".w33d.xyz"}}
+	target := "https://id.w33d.xyz" + ThemePath + "?to=blues&return=" + url.QueryEscape("https://evil.com/path")
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("status = %d, want 302", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Location"); got != "/path" {
+		t.Fatalf("Location = %q, want sanitized /path", got)
+	}
+	if c := findCookie(resp.Cookies(), ThemeCookieName); c != nil {
+		t.Fatalf("invalid theme set cookie: %#v", c)
+	}
+}
+
 func findCookie(cookies []*http.Cookie, name string) *http.Cookie {
 	for _, c := range cookies {
 		if c.Name == name {
