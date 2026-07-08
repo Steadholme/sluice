@@ -355,6 +355,90 @@ func TestTamperedCookieStartsLogin(t *testing.T) {
 	}
 }
 
+func TestOptionalMiddlewareInjectsSessionOrPassesAnonymous(t *testing.T) {
+	fi := newFakeIssuer(t)
+	p := newTestProvider(t, fi)
+
+	now := time.Now().Unix()
+	const sessionID = "session-optional"
+	if err := p.sessions.CreateSession(context.Background(), Session{
+		ID:        sessionID,
+		Sub:       testSub,
+		Email:     testEmail,
+		Scope:     requestedScope,
+		CreatedAt: now,
+		ExpiresAt: now + 3600,
+	}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	cases := []struct {
+		name         string
+		cookie       *http.Cookie
+		wantIdentity bool
+	}{
+		{
+			name: "valid session injects identity",
+			cookie: &http.Cookie{
+				Name:  DefaultCookieName,
+				Value: p.signer.sign(sessionID),
+			},
+			wantIdentity: true,
+		},
+		{
+			name: "missing cookie passes anonymously",
+		},
+		{
+			name: "invalid cookie passes anonymously",
+			cookie: &http.Cookie{
+				Name:  DefaultCookieName,
+				Value: "forged.deadbeef",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			var got *auth.Identity
+			var ok bool
+			h := p.OptionalMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				got, ok = auth.IdentityFromContext(r.Context())
+				w.WriteHeader(http.StatusNoContent)
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "/app", nil)
+			if tc.cookie != nil {
+				req.AddCookie(tc.cookie)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if !called {
+				t.Fatal("wrapped handler was not called")
+			}
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want 204", rec.Code)
+			}
+			if loc := rec.Header().Get("Location"); loc != "" {
+				t.Fatalf("unexpected redirect Location = %q", loc)
+			}
+			if tc.wantIdentity {
+				if !ok {
+					t.Fatal("identity missing from context")
+				}
+				if got.Subject != testSub || got.Email != testEmail || got.Scope != requestedScope {
+					t.Fatalf("identity = %#v, want sub=%s email=%s scope=%s", got, testSub, testEmail, requestedScope)
+				}
+				return
+			}
+			if ok {
+				t.Fatalf("anonymous request had identity: %#v", got)
+			}
+		})
+	}
+}
+
 // TestValidateIDTokenNonceBinding checks the nonce binding directly: a token whose
 // nonce differs from the stored value is rejected.
 func TestValidateIDTokenNonceBinding(t *testing.T) {

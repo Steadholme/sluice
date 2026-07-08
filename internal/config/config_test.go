@@ -201,6 +201,7 @@ func TestRouteAuthModeNormalization(t *testing.T) {
 		{"explicit public", Route{Name: "c", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "public", Protected: true}, AuthPublic, false},
 		{"explicit bearer", Route{Name: "d", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "BEARER"}, AuthBearer, true},
 		{"explicit sso syncs protected", Route{Name: "e", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "sso"}, AuthSSO, true},
+		{"explicit sso-optional validates", Route{Name: "f", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "sso-optional"}, AuthSSOOptional, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

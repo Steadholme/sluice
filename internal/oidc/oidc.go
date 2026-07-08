@@ -225,6 +225,23 @@ func (p *Provider) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// OptionalMiddleware is a non-gating SSO middleware: it injects the verified
+// identity when a valid gateway session exists, and otherwise passes the request
+// through ANONYMOUSLY (no login redirect). Upstreams must enforce their own auth
+// for writes; the proxy still strips any client-supplied X-Auth-* on this path,
+// so anonymous requests reach the upstream with no identity.
+func (p *Provider) OptionalMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if id, ok := p.sessionIdentity(r); ok {
+			accesslog.SetSubject(r.Context(), id.Subject)
+			ctx := auth.ContextWithIdentity(r.Context(), id)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // sessionIdentity resolves the __Secure-gw cookie to a live session identity. Any
 // failure (no cookie, bad signature, unknown/expired session) returns ok=false
 // so the caller starts a fresh login.

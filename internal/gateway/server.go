@@ -156,6 +156,21 @@ func authWrap(route config.Route, proxy http.Handler, opts Options) http.Handler
 			}
 		}
 		return opts.Provider.Middleware(inner)
+	case config.AuthSSOOptional:
+		if opts.Provider == nil {
+			// Optional SSO allows anonymous reads, so no provider degrades to the
+			// public path. No identity is injected in this case.
+			return proxy
+		}
+		inner := proxy
+		if opts.Authz.Enabled() {
+			// Never apply a group Gate on an optional route: anonymous callers have
+			// no identity/groups and must still reach the upstream. RequireGroup is
+			// advisory here; logged-in callers get groups injected for the upstream's
+			// own authorization decisions, while anonymous callers pass through.
+			inner = opts.Authz.InjectOnly(proxy)
+		}
+		return opts.Provider.OptionalMiddleware(inner)
 	default: // config.AuthPublic
 		return proxy
 	}

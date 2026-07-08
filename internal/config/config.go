@@ -97,12 +97,15 @@ const (
 
 // Per-route authentication modes (Route.Auth). They generalise the legacy
 // boolean Protected: "public" == not protected, "bearer" == the existing
-// forward-auth (Authorization: Bearer RS256 JWT) API path, and "sso" == the new
-// OIDC BROWSER SSO path (gateway session cookie, redirect to Keystone login).
+// forward-auth (Authorization: Bearer RS256 JWT) API path, "sso" == the OIDC
+// BROWSER SSO path (gateway session cookie, redirect to Keystone login), and
+// "sso-optional" == anonymous pass-through with identity injection only when a
+// valid gateway session already exists.
 const (
-	AuthPublic = "public"
-	AuthBearer = "bearer"
-	AuthSSO    = "sso"
+	AuthPublic      = "public"
+	AuthBearer      = "bearer"
+	AuthSSO         = "sso"
+	AuthSSOOptional = "sso-optional"
 )
 
 // OIDC browser-SSO + internal-mTLS environment variables. All are off by default
@@ -208,7 +211,8 @@ type Route struct {
 	Upstream  string `json:"upstream"`
 	Protected bool   `json:"protected"`
 
-	// Auth is the per-route authentication mode: "public" | "bearer" | "sso".
+	// Auth is the per-route authentication mode: "public" | "bearer" | "sso" |
+	// "sso-optional".
 	// It is optional and normalised by Validate: an empty value is derived from
 	// the legacy Protected boolean (true -> "bearer", false -> "public"), so
 	// existing configs and route rows keep their exact behavior. Protected is in
@@ -638,9 +642,9 @@ func normalizeAuth(r *Route) error {
 		}
 	}
 	switch r.Auth {
-	case AuthPublic, AuthBearer, AuthSSO:
+	case AuthPublic, AuthBearer, AuthSSO, AuthSSOOptional:
 	default:
-		return fmt.Errorf("invalid auth %q (want %s|%s|%s)", r.Auth, AuthPublic, AuthBearer, AuthSSO)
+		return fmt.Errorf("invalid auth %q (want %s|%s|%s|%s)", r.Auth, AuthPublic, AuthBearer, AuthSSO, AuthSSOOptional)
 	}
 	r.Protected = r.Auth != AuthPublic
 	return nil
