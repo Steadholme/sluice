@@ -55,6 +55,7 @@ const (
 const (
 	EnvListenAddr     = "LISTEN_ADDR"     // overrides listen_addr
 	EnvKeystoneIssuer = "KEYSTONE_ISSUER" // overrides keystone_issuer (and re-derives discovery)
+	EnvBearerAudience = "SLUICE_AUDIENCE" // expected bearer-token aud; empty = aud not enforced (v0)
 	EnvStore          = "SLUICE_STORE"    // route store kind: static|postgres (default static)
 	EnvDatabaseURL    = "DATABASE_URL"    // postgres DSN (postgres store)
 	EnvRoutesSeed     = "ROUTES_SEED"     // path to a routes seed config (postgres store)
@@ -247,6 +248,9 @@ func (r *Route) UpstreamURL() *url.URL { return r.upstreamURL }
 type Config struct {
 	ListenAddr           string        `json:"listen_addr"`
 	KeystoneIssuer       string        `json:"keystone_issuer"`
+	// BearerAudience, when non-empty, is the aud that bearer access tokens must
+	// carry (SLUICE_AUDIENCE). Empty keeps the v0 behavior: aud is not enforced.
+	BearerAudience       string        `json:"bearer_audience"`
 	DiscoveryURL         string        `json:"discovery_url"`
 	JWKSFetchURL         string        `json:"jwks_fetch_url"`
 	JWKSRefreshInterval  time.Duration `json:"jwks_refresh_interval"`
@@ -388,6 +392,9 @@ func (c *Config) ApplyEnv() {
 		// An explicit OIDC_DISCOVERY_URL below still wins because it is applied
 		// after this reset.
 		c.DiscoveryURL = ""
+	}
+	if v := os.Getenv(EnvBearerAudience); v != "" {
+		c.BearerAudience = v
 	}
 	// Issuer-vs-internal-fetch overrides. These point Sluice at the INTERNAL
 	// Keystone for fetching discovery/JWKS without changing the PUBLIC iss above.

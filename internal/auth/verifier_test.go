@@ -167,3 +167,29 @@ func TestRSAPublicKeyFromNEErrors(t *testing.T) {
 		t.Error("expected error for empty exponent")
 	}
 }
+
+// D10a: an expected audience, when configured, is enforced; empty keeps v0 (no aud check).
+func TestVerifierAudienceEnforcement(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	const kid = "test-kid-aud"
+	resolver := &testKeyResolver{keys: map[string]*rsa.PublicKey{kid: &priv.PublicKey}}
+	ctx := context.Background()
+	// mintRS256 stamps aud="sluice-dev".
+	token := mintRS256(t, priv, kid, testIssuer, time.Now().Add(time.Hour))
+
+	// Matching expected audience => accepted.
+	if _, err := NewVerifierWithAudience(resolver, testIssuer, "sluice-dev").Validate(ctx, token); err != nil {
+		t.Fatalf("matching aud should validate, got: %v", err)
+	}
+	// Different expected audience => rejected (a token minted for another resource server).
+	if _, err := NewVerifierWithAudience(resolver, testIssuer, "other-service").Validate(ctx, token); err == nil {
+		t.Fatal("mismatched aud should be rejected")
+	}
+	// Empty audience keeps v0 behavior: aud not checked, any aud accepted.
+	if _, err := NewVerifierWithAudience(resolver, testIssuer, "").Validate(ctx, token); err != nil {
+		t.Fatalf("empty aud must not enforce, got: %v", err)
+	}
+}

@@ -1,1 +1,5 @@
 {"type":"cli","id":"CLI-1783478262460-1","timestamp":"2026-07-08T02:37:42.460Z","command":"load","args":{"type":"spec","category":"learning"}}
+{"type":"cli","id":"CLI-1783497653306-1","timestamp":"2026-07-08T08:00:53.306Z","command":"load","args":{"type":"spec","category":"coding"}}
+{"type":"cli","id":"CLI-1783497653359-1","timestamp":"2026-07-08T08:00:53.359Z","command":"load","args":{"type":"spec","category":"test"}}
+{"type":"cli","id":"CLI-1783497678347-1","timestamp":"2026-07-08T08:01:18.347Z","command":"load","args":{"type":"project"}}
+{"type":"cli","id":"CLI-1783497678531-1","timestamp":"2026-07-08T08:01:18.531Z","command":"load","args":{"type":"knowhow"}}

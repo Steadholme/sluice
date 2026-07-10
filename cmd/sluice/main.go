@@ -74,7 +74,7 @@ func main() {
 		log.Warn("jwks warm-up failed; will retry lazily", "error", err)
 	}
 	cancel()
-	verifier := auth.NewVerifier(jwks, cfg.KeystoneIssuer)
+	verifier := auth.NewVerifierWithAudience(jwks, cfg.KeystoneIssuer, cfg.BearerAudience)
 
 	// Non-blocking audit emitter (env-toggled by AUDIT_ENABLED). When off it is a
 	// no-op; when on it fire-and-forget POSTs security events to Watchtower without

@@ -12,10 +12,10 @@ import (
 // supplies iss/aud/exp/iat; Subject and Scope are the application claims that
 // get injected downstream.
 //
-// Note: aud is intentionally NOT enforced in v0. Sluice is a resource server
-// that does not yet know the expected client_id/audience. The seam to enforce
-// it (jwt.WithAudience) lives in Validate once expected audiences are
-// configurable.
+// Note: aud is enforced only when the Verifier is built with a non-empty
+// expected audience (NewVerifierWithAudience, wired from SLUICE_AUDIENCE). With
+// no configured audience Sluice keeps the v0 behavior and does not check aud, so
+// existing deployments are unaffected.
 type Claims struct {
 	Subject string `json:"sub"`
 	Scope   string `json:"scope"`
@@ -37,12 +37,25 @@ type Verifier struct {
 
 // NewVerifier builds a Verifier pinned to RS256, requiring exp and the
 // configured issuer. Pinning the method defeats alg=none and RS->HS confusion.
+// Audience is NOT enforced; use NewVerifierWithAudience to require a specific aud.
 func NewVerifier(keys keyResolver, issuer string) *Verifier {
-	parser := jwt.NewParser(
+	return NewVerifierWithAudience(keys, issuer, "")
+}
+
+// NewVerifierWithAudience is like NewVerifier but, when audience is non-empty,
+// additionally requires the token's aud to contain it (jwt.WithAudience). An
+// empty audience keeps the v0 behavior (aud not enforced), so tokens minted by
+// the same issuer for a DIFFERENT resource server are then rejected here.
+func NewVerifierWithAudience(keys keyResolver, issuer, audience string) *Verifier {
+	opts := []jwt.ParserOption{
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer(issuer),
 		jwt.WithExpirationRequired(),
-	)
+	}
+	if audience != "" {
+		opts = append(opts, jwt.WithAudience(audience))
+	}
+	parser := jwt.NewParser(opts...)
 	return &Verifier{keys: keys, issuer: issuer, parser: parser}
 }
 
