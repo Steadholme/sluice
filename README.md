@@ -65,6 +65,9 @@ go run ./cmd/sluice -config config.json
 | `GW_TOKEN_URL` | **内网** token 端点（开 mTLS 时 `https://keystone:8443/token`，否则 `http://keystone:8080/token`） | 空 |
 | `GW_SESSION_TTL` | 网关浏览器会话有效期（Go duration，如 `8h`） | `8h` |
 | `GW_SESSION_SECRET` | 签名 `__Secure-gw` 不透明 cookie id 的 HMAC 密钥（强随机、稳定） | 空（缺省临时随机，重启失效） |
+| `GATEWAY_HMAC_KEY` | 签名上游 `X-Auth-Sig` 身份的共享 HMAC 密钥 | 空（不注入 identity signature） |
+| `GATEWAY_ZONE_HMAC_KEY` | 仅由 Sluice 与目标 consumer 持有，签名 route+host-bound `X-Gateway-Zone-Sig`；不能复用 identity key | 空（不注入 zone signature） |
+| `GATEWAY_ZONE` | Sluice 为每个上游请求重写的访问平面：`internal` 或 `external` | `external` |
 | `INTERNAL_MTLS` | 到 Keystone 内网跳启用 **mTLS**：`on`/`off` | `off` |
 | `KEYSTONE_MTLS_CERT` / `KEYSTONE_MTLS_KEY` | Keyward 签发的客户端证书 + 私钥（CN=sluice，PEM） | 空 |
 | `KEYSTONE_MTLS_CA` | 信任锚 PEM（Keyward root CA） | 空 |
@@ -282,7 +285,11 @@ scheme：`off` 走 `LISTEN_ADDR` 的明文 HTTP，`file`/`acme` 走 `HTTPS_ADDR`
 - **可移植 Postgres 路由数据层**（`SLUICE_STORE=postgres`）：`pgx/v5` + 幂等
   `CREATE TABLE IF NOT EXISTS`，仅用标准 SQL，空表时从配置 routes 幂等播种；默认仍走静态
   内存 store，现有测试无需数据库。
-- 在每个路由上剥离客户端伪造的 `X-Auth-*` 头，仅由校验通过的中间件注入可信值。
+- 在每个路由上剥离客户端伪造的 `X-Auth-*`、`X-Gateway-Zone` 与
+  `X-Gateway-Zone-Sig`，仅由网关注入可信值。zone signature 使用
+  `holdfast.gateway-zone.v1\n{route_name}\n{route_host}\n{zone}\n{epoch_minute}`，因此从其他
+  upstream 或同 host 的其他 route 取得的短时签名不能重放给 Portal；consumer 还必须固定
+  校验自己的 canonical route 与 host。
 - 结构化访问日志。
 - 完整端到端契约测试 `test/integration_test.go`（伪 Keystone + echo 上游 + 真实 Sluice）。
 

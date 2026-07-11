@@ -2,6 +2,7 @@ package config
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -353,6 +354,7 @@ func TestGatewayDefaults(t *testing.T) {
 
 func TestApplyEnvGatewayZoneOverride(t *testing.T) {
 	t.Setenv(EnvGatewayZone, GatewayZoneInternal)
+	t.Setenv(EnvGatewayZoneHMACKey, "zone-context-key")
 
 	c := minimalValid()
 	c.ApplyEnv()
@@ -361,6 +363,20 @@ func TestApplyEnvGatewayZoneOverride(t *testing.T) {
 	}
 	if c.GatewayZone != GatewayZoneInternal {
 		t.Errorf("GatewayZone = %q, want %q", c.GatewayZone, GatewayZoneInternal)
+	}
+	if c.GatewayZoneHMACKey != "zone-context-key" {
+		t.Errorf("GatewayZoneHMACKey = %q, want env override", c.GatewayZoneHMACKey)
+	}
+}
+
+func TestValidateRejectsReusedGatewayContextKey(t *testing.T) {
+	c := minimalValid()
+	c.GatewayHMACKey = "shared-key"
+	c.GatewayZoneHMACKey = "shared-key"
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Fatalf("Validate error = %v, want distinct gateway HMAC keys error", err)
 	}
 }
 

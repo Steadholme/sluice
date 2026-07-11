@@ -140,6 +140,7 @@ func main() {
 		PublicOnly:           cfg.PublicOnly,
 		PublicOnlyAllowHosts: hostSet(cfg.PublicOnlyAllow),
 		GatewayHMACKey:       cfg.GatewayHMACKey,
+		GatewayZoneHMACKey:   cfg.GatewayZoneHMACKey,
 		GatewayZone:          cfg.GatewayZone,
 		SessionCookieName:    oidc.DefaultCookieName,
 	}

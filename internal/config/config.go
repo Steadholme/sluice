@@ -145,6 +145,7 @@ const (
 	EnvVerdictURL          = "VERDICT_URL"           // Verdict base URL, e.g. http://verdict:9140
 	EnvVerdictServiceToken = "VERDICT_SERVICE_TOKEN" // bearer credential for Verdict /api/*
 	EnvGatewayHMACKey      = "GATEWAY_HMAC_KEY"      // HMAC key binding injected identity into X-Auth-Sig
+	EnvGatewayZoneHMACKey  = "GATEWAY_ZONE_HMAC_KEY" // dedicated HMAC key binding route+host+zone
 	EnvGatewayZone         = "GATEWAY_ZONE"          // internal|external zone injected into X-Gateway-Zone
 )
 
@@ -309,9 +310,11 @@ type Config struct {
 	VerdictServiceToken string `json:"verdict_service_token"`
 
 	// GatewayHMACKey, when set, makes the proxy sign the injected identity into
-	// X-Auth-Sig (HMAC over subject+groups+minute) so backends can prove it came
-	// from Sluice. Empty = no signature (backward compatible).
+	// X-Auth-Sig so backends can prove it came from Sluice.
 	GatewayHMACKey string `json:"gateway_hmac_key"`
+	// GatewayZoneHMACKey is a separate, narrowly distributed key for the route+host-bound
+	// X-Gateway-Zone-Sig. It must not inherit the estate-wide identity verification key.
+	GatewayZoneHMACKey string `json:"gateway_zone_hmac_key"`
 	// GatewayZone is injected into X-Gateway-Zone on every forwarded request.
 	// Empty defaults to "external" so an unset public gateway never claims internal.
 	GatewayZone string `json:"gateway_zone"`
@@ -512,6 +515,9 @@ func (c *Config) ApplyEnv() {
 	if v := os.Getenv(EnvGatewayHMACKey); v != "" {
 		c.GatewayHMACKey = v
 	}
+	if v := os.Getenv(EnvGatewayZoneHMACKey); v != "" {
+		c.GatewayZoneHMACKey = v
+	}
 	if v := os.Getenv(EnvGatewayZone); v != "" {
 		c.GatewayZone = v
 	}
@@ -605,6 +611,9 @@ func (c *Config) Validate() error {
 	c.applyGatewayDefaults()
 	if err := c.normalizeGatewayZone(); err != nil {
 		return err
+	}
+	if c.GatewayHMACKey != "" && c.GatewayZoneHMACKey == c.GatewayHMACKey {
+		return fmt.Errorf("gateway_zone_hmac_key must be distinct from gateway_hmac_key")
 	}
 	c.applyWAFDefaults()
 

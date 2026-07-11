@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
@@ -36,9 +37,18 @@ func newGatewayTestProvider(t *testing.T) *oidc.Provider {
 }
 
 func TestGatewayZoneHeaderOverwritesInbound(t *testing.T) {
-	seen := make(chan []string, 1)
+	type contextHeaders struct {
+		zones []string
+		sigs  []string
+		unix  int64
+	}
+	seen := make(chan contextHeaders, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen <- r.Header.Values(gatewayZoneHeader)
+		seen <- contextHeaders{
+			zones: r.Header.Values(gatewayZoneHeader),
+			sigs:  r.Header.Values(auth.HeaderGatewayZoneSig),
+			unix:  time.Now().Unix(),
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
@@ -46,12 +56,16 @@ func TestGatewayZoneHeaderOverwritesInbound(t *testing.T) {
 	store := mustRoutes(t, []config.Route{
 		{Name: "public", Match: config.Match{Host: "public.example", PathPrefix: "/"}, Upstream: upstream.URL, Auth: config.AuthPublic},
 	})
-	handler := NewServer(store, Options{GatewayZone: config.GatewayZoneInternal}).Handler()
+	handler := NewServer(store, Options{
+		GatewayZone:        config.GatewayZoneInternal,
+		GatewayZoneHMACKey: "test-key",
+	}).Handler()
 
 	req := httptest.NewRequest(http.MethodGet, "http://public.example/", nil)
 	req.Host = "public.example"
 	req.Header.Add(gatewayZoneHeader, config.GatewayZoneExternal)
 	req.Header.Add(gatewayZoneHeader, "spoofed")
+	req.Header.Set(auth.HeaderGatewayZoneSig, "spoofed")
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -60,11 +74,19 @@ func TestGatewayZoneHeaderOverwritesInbound(t *testing.T) {
 		t.Fatalf("status = %d, want 204", rec.Code)
 	}
 	got := <-seen
-	if len(got) != 1 {
-		t.Fatalf("%s values = %v, want exactly one", gatewayZoneHeader, got)
+	if len(got.zones) != 1 {
+		t.Fatalf("%s values = %v, want exactly one", gatewayZoneHeader, got.zones)
 	}
-	if got[0] != config.GatewayZoneInternal {
-		t.Errorf("%s = %q, want %q", gatewayZoneHeader, got[0], config.GatewayZoneInternal)
+	if got.zones[0] != config.GatewayZoneInternal {
+		t.Errorf("%s = %q, want %q", gatewayZoneHeader, got.zones[0], config.GatewayZoneInternal)
+	}
+	if len(got.sigs) != 1 || got.sigs[0] == "" || got.sigs[0] == "spoofed" {
+		t.Errorf("%s values = %v, want one Sluice-minted signature", auth.HeaderGatewayZoneSig, got.sigs)
+	}
+	current := auth.SignGatewayZone("test-key", "public", "public.example", config.GatewayZoneInternal, got.unix)
+	previous := auth.SignGatewayZone("test-key", "public", "public.example", config.GatewayZoneInternal, got.unix-60)
+	if got.sigs[0] != current && got.sigs[0] != previous {
+		t.Errorf("%s is not bound to the matched route, host, zone, and current window", auth.HeaderGatewayZoneSig)
 	}
 }
 

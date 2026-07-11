@@ -31,8 +31,8 @@ const (
 //   - PRESERVES the inbound Host header toward the upstream (instead of rewriting
 //     it to the upstream's host) so a fronted Keystone sees the public host
 //     (id.w33d.xyz) and builds correct absolute OIDC URLs;
-//   - strips every client-supplied X-Gateway-Zone header, then injects the
-//     configured gateway zone.
+//   - strips every client-supplied X-Gateway-Zone and X-Gateway-Zone-Sig header,
+//     then injects the configured zone plus a host-bound signature when configured.
 //   - strips every client-supplied X-Auth-* header, then injects the verified
 //     X-Auth-Subject / X-Auth-Scope from the auth context when present.
 //
@@ -42,7 +42,7 @@ const (
 // When mtls is non-nil and the upstream is https (the internal Keystone hop under
 // INTERNAL_MTLS=on), the proxy uses the mTLS transport so it presents the Keyward
 // client certificate; plain-http upstreams keep the default transport unchanged.
-func newReverseProxy(route config.Route, mtls *http.Transport, hmacKey, gatewayZone, sessionCookie string) *httputil.ReverseProxy {
+func newReverseProxy(route config.Route, mtls *http.Transport, identityHMACKey, zoneHMACKey, gatewayZone, sessionCookie string) *httputil.ReverseProxy {
 	target := route.UpstreamURL()
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -57,6 +57,10 @@ func newReverseProxy(route config.Route, mtls *http.Transport, hmacKey, gatewayZ
 
 			pr.Out.Header.Del(gatewayZoneHeader)
 			pr.Out.Header.Set(gatewayZoneHeader, gatewayZone)
+			pr.Out.Header.Del(auth.HeaderGatewayZoneSig)
+			if sig := auth.SignGatewayZone(zoneHMACKey, route.Name, route.Match.Host, gatewayZone, time.Now().Unix()); sig != "" {
+				pr.Out.Header.Set(auth.HeaderGatewayZoneSig, sig)
+			}
 
 			stripAuthHeaders(pr.Out.Header)
 			// Non-SSO routes are untrusted from the estate's point of view — most
@@ -82,7 +86,7 @@ func newReverseProxy(route config.Route, mtls *http.Transport, hmacKey, gatewayZ
 				// Cryptographically bind subject+groups to a 1-minute window so a backend
 				// sharing GATEWAY_HMAC_KEY can prove Sluice minted this identity. Key unset
 				// => "" => header omitted, so behavior is unchanged until the key is set.
-				if sig := auth.SignIdentity(hmacKey, id.Subject, groups, time.Now().Unix()); sig != "" {
+				if sig := auth.SignIdentity(identityHMACKey, id.Subject, groups, time.Now().Unix()); sig != "" {
 					pr.Out.Header.Set(auth.HeaderAuthSig, sig)
 				}
 			}

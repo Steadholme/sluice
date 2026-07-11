@@ -32,6 +32,35 @@ func TestSignIdentityEmptyKeyIsBlank(t *testing.T) {
 	}
 }
 
+func TestSignGatewayZoneVectors(t *testing.T) {
+	cases := []struct {
+		routeName string
+		host      string
+		zone      string
+		unix      int64
+		want      string
+	}{
+		{routeName: "portal-root", host: "w33d.xyz", zone: "internal", unix: 90, want: "3467eb3d618ce5a1d3a0c703f78f3f89f3fb5d80586b78a258fb07352b53f4e3"},
+		{routeName: "status-root", host: "status.w33d.xyz", zone: "external", unix: 120, want: "2dbfd816d00da99ff7608e8a72d8a6ff038aab2a1f92997014272a9edcb4998d"},
+	}
+	for _, test := range cases {
+		if got := SignGatewayZone("test-key", test.routeName, test.host, test.zone, test.unix); got != test.want {
+			t.Errorf("SignGatewayZone(%q,%q,%q,%d) = %s, want %s", test.routeName, test.host, test.zone, test.unix, got, test.want)
+		}
+	}
+	if got := SignGatewayZone("", "portal-root", "w33d.xyz", "internal", 90); got != "" {
+		t.Errorf("empty key must yield empty zone signature, got %s", got)
+	}
+
+	sig := SignGatewayZone("test-key", "portal-root", "w33d.xyz", "internal", 90)
+	if replay := SignGatewayZone("test-key", "portal-root", "other.w33d.xyz", "internal", 90); replay == sig {
+		t.Fatal("gateway-zone signature must be bound to its target host")
+	}
+	if replay := SignGatewayZone("test-key", "other-root", "w33d.xyz", "internal", 90); replay == sig {
+		t.Fatal("gateway-zone signature must be bound to its target route")
+	}
+}
+
 // The same identity in the same minute is stable; a new minute rotates the signature.
 func TestSignIdentityWindowRotation(t *testing.T) {
 	a := SignIdentity("k", "s", "g", 90)  // window 1
