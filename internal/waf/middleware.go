@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/holdfast/sluice/internal/accesslog"
 	"github.com/holdfast/sluice/internal/audit"
 )
 
@@ -186,7 +187,7 @@ func (e *Engine) emit(action, actor string, r *http.Request, detail string) {
 	e.auditor.Emit(audit.Event{
 		Actor:    actor,
 		Action:   action,
-		Target:   r.Method + " " + r.URL.Path,
+		Target:   r.Method + " " + accesslog.RedactPath(r.Host, r.URL.Path),
 		Severity: audit.SeverityWarning,
 		Detail:   detail,
 		Source:   audit.SourceSluice,

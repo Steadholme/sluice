@@ -15,7 +15,8 @@ Sluice 是 Holdfast 平台的 L7 反向代理 / SSO 网关（v0），基于 Go �
   （通过 OIDC discovery 发现 `jwks_uri`，按 `kid` 缓存）校验 RS256 签名，并验证 `iss` 与 `exp`；
   成功后向上游注入 `X-Auth-Subject`(=sub) 与 `X-Auth-Scope`(=scope)，失败统一返回
   `401` + `WWW-Authenticate: Bearer`。
-- 每个请求输出一行结构化 slog JSON 访问日志（method/path/status/upstream/duration_ms/sub）。
+- 每个请求输出一行结构化 slog JSON 访问日志（method/path/status/upstream/duration_ms/sub）；Blog `/review/` 与 Drive `/receipts/`、`/s/`、`/u/` 的 authority-bearing path tail 在 access/auth/WAF telemetry 中 fail-safe 替换为 `[capability]`，不依赖 Host 或 token 是否有效；仅固定的 Share Room CSS/JS 资源名保持可观测。
+- 同一组 capability namespace 的所有响应（包括 router `404`、method `405` 与 proxy `502`）由最外层 security wrapper 强制 `Referrer-Policy: no-referrer` 与 `Cache-Control: private, no-store`；仅 `/s/share-room.css`、`/s/share-room.js` 保留产品的 public cache，普通路径继续使用 `strict-origin-when-cross-origin` 基线。
 
 ## 如何运行
 

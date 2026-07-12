@@ -51,6 +51,32 @@ func SetSubject(ctx context.Context, subject string) {
 	}
 }
 
+// RedactPath removes the complete authority-bearing tail from HOLDFAST's public capability
+// namespaces before a request path enters access, auth or WAF telemetry. The decision is based on
+// the path rather than Host or token validity: malformed requests, a trailing-dot Host and a token
+// sent to the wrong virtual host must be just as unable to disclose a secret as a valid request.
+// Query strings are already excluded from the access log. The only non-secret names beneath /s/
+// are the two fixed Share Room assets; every other /s/ tail is capability-bearing, including the
+// nested /s/folder/{token} route.
+func RedactPath(_ string, path string) string {
+	switch {
+	case path == "/s/share-room.css", path == "/s/share-room.js":
+		return path
+	case len(path) > len("/s/folder/") && path[:len("/s/folder/")] == "/s/folder/":
+		return "/s/folder/[capability]"
+	case len(path) > len("/review/") && path[:len("/review/")] == "/review/":
+		return "/review/[capability]"
+	case len(path) > len("/receipts/") && path[:len("/receipts/")] == "/receipts/":
+		return "/receipts/[capability]"
+	case len(path) > len("/u/") && path[:len("/u/")] == "/u/":
+		return "/u/[capability]"
+	case len(path) > len("/s/") && path[:len("/s/")] == "/s/":
+		return "/s/[capability]"
+	default:
+		return path
+	}
+}
+
 // Wrap returns a handler that logs one JSON line per request after next runs.
 func Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,7 +91,7 @@ func Wrap(next http.Handler) http.Handler {
 
 		logger.LogAttrs(r.Context(), slog.LevelInfo, "access",
 			slog.String("method", r.Method),
-			slog.String("path", r.URL.Path),
+			slog.String("path", RedactPath(r.Host, r.URL.Path)),
 			slog.Int("status", sr.status),
 			slog.String("upstream", rec.upstream),
 			slog.Float64("duration_ms", durMs),

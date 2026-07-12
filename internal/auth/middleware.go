@@ -99,12 +99,13 @@ func Middleware(v *Verifier, next http.Handler, opts ...Option) http.Handler {
 	}
 	em := o.auditor
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auditTarget := accesslog.RedactPath(r.Host, r.URL.Path)
 		raw, ok := bearerToken(r.Header.Get("Authorization"))
 		if !ok {
 			em.Emit(audit.Event{
 				Actor:    "anonymous",
 				Action:   audit.ActionForwardAuthDeny,
-				Target:   r.URL.Path,
+				Target:   auditTarget,
 				Severity: audit.SeverityWarning,
 				Detail:   "missing token",
 			})
@@ -116,7 +117,7 @@ func Middleware(v *Verifier, next http.Handler, opts ...Option) http.Handler {
 			em.Emit(audit.Event{
 				Actor:    "anonymous",
 				Action:   audit.ActionForwardAuthDeny,
-				Target:   r.URL.Path,
+				Target:   auditTarget,
 				Severity: audit.SeverityWarning,
 				Detail:   denyReason(err),
 			})
@@ -131,7 +132,7 @@ func Middleware(v *Verifier, next http.Handler, opts ...Option) http.Handler {
 		em.Emit(audit.Event{
 			Actor:    claims.Subject,
 			Action:   audit.ActionForwardAuthAllow,
-			Target:   r.URL.Path,
+			Target:   auditTarget,
 			Severity: audit.SeverityInfo,
 		})
 
