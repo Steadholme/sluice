@@ -27,7 +27,7 @@ WORKDIR /app
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/sluice /usr/local/bin/sluice
 # A default config (static store, dev routes) used by the TLS_MODE=off smoke, plus
-# the production Holdfast route table that fronts Keystone. Override by mounting
+# the production Steadholme route table that fronts Keystone. Override by mounting
 # your own and pointing -config at it, or by setting the env knobs.
 COPY config.example.json /app/config.json
 COPY config.holdfast.json /app/config.holdfast.json

@@ -51,7 +51,7 @@ func SetSubject(ctx context.Context, subject string) {
 	}
 }
 
-// RedactPath removes the complete authority-bearing tail from HOLDFAST's public capability
+// RedactPath removes the complete authority-bearing tail from Steadholme's public capability
 // namespaces before a request path enters access, auth or WAF telemetry. The decision is based on
 // the path rather than Host or token validity: malformed requests, a trailing-dot Host and a token
 // sent to the wrong virtual host must be just as unable to disclose a secret as a valid request.

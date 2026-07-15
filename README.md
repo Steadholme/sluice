@@ -1,6 +1,6 @@
 # Sluice
 
-Sluice 是 Holdfast 平台的 L7 反向代理 / SSO 网关（v0），基于 Go 标准库 `net/http` +
+Sluice 是 Steadholme 平台的 L7 反向代理 / SSO 网关（v0），基于 Go 标准库 `net/http` +
 `httputil.ReverseProxy` 构建，仅引入一个外部依赖 `github.com/golang-jwt/jwt/v5`
 用于标准正确的 RS256 JWT 校验。
 
@@ -79,7 +79,7 @@ go run ./cmd/sluice -config config.json
 
 ### TLS 终止与公网暴露
 
-Sluice 是整套 Holdfast 的**唯一公网面**：它在 `id.w33d.xyz` 上终止 TLS 并反代到内网
+Sluice 是整套 Steadholme 的**唯一公网面**：它在 `id.w33d.xyz` 上终止 TLS 并反代到内网
 Keystone / whoami（后者均不对外发布）。`TLS_MODE` 选择终止方式：
 
 - **`off`（默认，开发）**：在 `LISTEN_ADDR` 上绑定单一明文 HTTP，行为与历史完全一致。

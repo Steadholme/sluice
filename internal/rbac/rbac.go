@@ -177,7 +177,7 @@ func (a *Authorizer) fetchGroups(ctx context.Context, subject string) ([]string,
 
 const forbiddenHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>403 · HOLDFAST</title>
+<title>403 · Steadholme</title>
 <style>body{font:16px/1.5 system-ui,sans-serif;background:#f4f4f4;color:#272727;margin:0;
 display:flex;min-height:100vh;align-items:center;justify-content:center}
 .card{background:#fff;border:1px solid #e1e1e1;border-radius:12px;padding:40px 44px;max-width:460px;text-align:center}
