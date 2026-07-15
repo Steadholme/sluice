@@ -25,7 +25,7 @@ const (
 	testKID      = "kid-oidc-test"
 	testClientID = "gw-sluice"
 	testSub      = "u_admin"
-	testEmail    = "admin@holdfast.local"
+	testEmail    = "admin@steadholme.local"
 )
 
 // fakeIssuer is an httptest OIDC provider: /authorize auto-approves (simulating an

@@ -121,7 +121,7 @@ func (fo *fakeOIDC) signID(t *testing.T, nonce string) string {
 	claims := jwt.MapClaims{
 		"iss": fo.url, "sub": "u_admin", "aud": fo.clientID,
 		"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Add(-time.Minute).Unix(),
-		"email": "admin@holdfast.local", "nonce": nonce,
+		"email": "admin@steadholme.local", "nonce": nonce,
 	}
 	return fo.sign(t, claims)
 }
@@ -271,8 +271,8 @@ func TestGatewaySSOEndToEnd(t *testing.T) {
 		if got := first(h["X-Auth-Subject"]); got != "u_admin" {
 			t.Errorf("X-Auth-Subject = %q, want u_admin", got)
 		}
-		if got := first(h["X-Auth-Email"]); got != "admin@holdfast.local" {
-			t.Errorf("X-Auth-Email = %q, want admin@holdfast.local", got)
+		if got := first(h["X-Auth-Email"]); got != "admin@steadholme.local" {
+			t.Errorf("X-Auth-Email = %q, want admin@steadholme.local", got)
 		}
 		if got := first(h["X-Auth-Scope"]); got == "" {
 			t.Error("X-Auth-Scope not injected")
@@ -467,7 +467,7 @@ func TestGatewaySSOCrossSubdomainCookie(t *testing.T) {
 	if got := first(h["X-Auth-Subject"]); got != "u_admin" {
 		t.Errorf("cross-subdomain X-Auth-Subject = %q, want u_admin", got)
 	}
-	if got := first(h["X-Auth-Email"]); got != "admin@holdfast.local" {
-		t.Errorf("cross-subdomain X-Auth-Email = %q, want admin@holdfast.local", got)
+	if got := first(h["X-Auth-Email"]); got != "admin@steadholme.local" {
+		t.Errorf("cross-subdomain X-Auth-Email = %q, want admin@steadholme.local", got)
 	}
 }
