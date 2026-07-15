@@ -113,7 +113,7 @@ Keystone（`http://keystone:8080`）抓取 JWKS，避免穿过自身 TLS 回环�
 # 生产（acme）：env 提供 TLS 模式，路由表来自 config.holdfast.json
 docker run -d --name sluice -p 80:80 -p 443:443 -v sluice-acme:/acme \
   -e TLS_MODE=acme -e ACME_DOMAIN=id.w33d.xyz -e ACME_EMAIL=momoxiaomaster@gmail.com \
-  holdfast/sluice:dev -config /app/config.holdfast.json
+  steadholme/sluice:dev -config /app/config.holdfast.json
 ```
 
 ```bash
@@ -229,8 +229,8 @@ Watchtower 不可达即**丢弃并计数**（warn 日志），错误绝不回传
 ### 容器运行
 
 ```bash
-docker build -t holdfast/sluice:dev .
-docker run -d --name sluice -p 9090:9090 holdfast/sluice:dev
+docker build -t steadholme/sluice:dev .
+docker run -d --name sluice -p 9090:9090 steadholme/sluice:dev
 curl http://127.0.0.1:9090/healthz   # -> ok
 ```
 
