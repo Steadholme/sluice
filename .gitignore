@@ -14,3 +14,7 @@
 # Rust (none in this repo, kept for ecosystem parity)
 /target
 **/*.rs.bk
+
+# Maestro generated indexes
+/.workflow/search-cache.json
+/.workflow/wiki-index.json
