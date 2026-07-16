@@ -67,7 +67,7 @@ go run ./cmd/sluice -config config.json
 | `GW_TOKEN_URL` | **内网** token 端点（开 mTLS 时 `https://keystone:8443/token`，否则 `http://keystone:8080/token`） | 空 |
 | `GW_SESSION_TTL` | 网关浏览器会话有效期（Go duration，如 `8h`） | `8h` |
 | `GW_SESSION_SECRET` | 签名 `__Secure-gw` 不透明 cookie id 的 HMAC 密钥（强随机、稳定） | 空（缺省临时随机，重启失效） |
-| `GATEWAY_HMAC_KEY` | 签名上游 `X-Auth-Sig` 身份的共享 HMAC 密钥 | 空（不注入 identity signature） |
+| `GATEWAY_HMAC_KEY` | 签名上游 `X-Auth-Sig` 身份；PAT 路由还用同一共享密钥生成独立 domain 的 `X-Auth-Scope-Sig` | 空（不注入 identity / PAT scope signature） |
 | `GATEWAY_ZONE_HMAC_KEY` | 仅由 Sluice 与目标 consumer 持有，签名 route+host-bound `X-Gateway-Zone-Sig`；不能复用 identity key | 空（不注入 zone signature） |
 | `GATEWAY_ZONE` | Sluice 为每个上游请求重写的访问平面：`internal` 或 `external` | `external` |
 | `INTERNAL_MTLS` | 到 Keystone 内网跳启用 **mTLS**：`on`/`off` | `off` |
@@ -155,7 +155,11 @@ go run ./cmd/sluice -config config.json
   对每个请求用现有 `GW_CLIENT_ID` / `GW_CLIENT_SECRET` Basic auth，经现有内网 mTLS
   client 向显式 `PAT_INTROSPECTION_URL` POST `token` form。inactive 返回 `401`，缺 exact
   scope 返回 `403`，依赖故障/非 `200`/坏响应返回 `503`。原始 PAT 不会进入上游，所有
-  outcome 强制 `Cache-Control: private, no-store` 与 `Vary: Authorization`。
+  outcome 强制 `Cache-Control: private, no-store` 与 `Vary: Authorization`。鉴权成功且配置
+  `GATEWAY_HMAC_KEY` 时，额外注入 `X-Auth-Scope-Sig`：它使用 domain
+  `holdfast.pat-scope.v1`，把 verified subject、introspection 返回的完整 granted scope、路由
+  `require_scope` 与 epoch minute 绑定；后端按当前/上一分钟验签。既有 `X-Auth-Sig` canonical
+  与所有非 PAT 路由行为保持不变，客户端提供的同名签名会先被清除。
 - **`sso`**：新增 **浏览器 SSO**——见下。
 - **`sso-optional`**：允许匿名读取；存在有效网关会话时才注入 SSO Identity。
 

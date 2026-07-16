@@ -32,6 +32,59 @@ func TestSignIdentityEmptyKeyIsBlank(t *testing.T) {
 	}
 }
 
+func TestSignPATScopeVector(t *testing.T) {
+	const want = "405cea451b81706349a89dfcccb4db503e972d7afe8019c4cf54beedebd530aa"
+	got := SignPATScope(
+		"test-key",
+		"usr_alice",
+		"profile corvid:temp-mail:manage",
+		"corvid:temp-mail:manage",
+		90,
+	)
+	if got != want {
+		t.Fatalf("SignPATScope() = %s, want %s", got, want)
+	}
+}
+
+func TestSignPATScopeBindsEveryAuthorizationField(t *testing.T) {
+	const (
+		key      = "test-key"
+		subject  = "usr_alice"
+		granted  = "profile corvid:temp-mail:manage"
+		required = "corvid:temp-mail:manage"
+	)
+	want := SignPATScope(key, subject, granted, required, 90)
+	tests := []struct {
+		name, subject, granted, required string
+	}{
+		{name: "subject", subject: "usr_mallory", granted: granted, required: required},
+		{name: "granted scope", subject: subject, granted: "profile", required: required},
+		{name: "required scope", subject: subject, granted: granted, required: "corvid:temp-mail:delete"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := SignPATScope(key, test.subject, test.granted, test.required, 90); got == want {
+				t.Fatal("tampered authorization field produced the original signature")
+			}
+		})
+	}
+}
+
+func TestSignPATScopeWindowRotationAndEmptyKey(t *testing.T) {
+	a := SignPATScope("k", "s", "g", "r", 90)
+	b := SignPATScope("k", "s", "g", "r", 119)
+	c := SignPATScope("k", "s", "g", "r", 120)
+	if a != b {
+		t.Error("same minute must produce the same PAT scope signature")
+	}
+	if a == c {
+		t.Error("a new minute must rotate the PAT scope signature")
+	}
+	if got := SignPATScope("", "s", "g", "r", 90); got != "" {
+		t.Errorf("empty key must yield empty PAT scope signature, got %s", got)
+	}
+}
+
 func TestSignGatewayZoneVectors(t *testing.T) {
 	cases := []struct {
 		routeName string

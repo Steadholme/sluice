@@ -169,18 +169,22 @@ func TestSSOOptionalAnonymousRoutePassesThroughWithoutGateOrSpoofedIdentity(t *t
 
 func TestPATRouteTerminatesTokenAndInjectsOnlyVerifiedIdentity(t *testing.T) {
 	type observed struct {
-		authorization string
-		subject       string
-		scope         string
-		signature     string
+		authorization   string
+		subject         string
+		scope           string
+		signature       string
+		scopeSignatures []string
+		unix            int64
 	}
 	seen := make(chan observed, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen <- observed{
-			authorization: r.Header.Get("Authorization"),
-			subject:       r.Header.Get(auth.HeaderAuthSubject),
-			scope:         r.Header.Get(auth.HeaderAuthScope),
-			signature:     r.Header.Get(auth.HeaderAuthSig),
+			authorization:   r.Header.Get("Authorization"),
+			subject:         r.Header.Get(auth.HeaderAuthSubject),
+			scope:           r.Header.Get(auth.HeaderAuthScope),
+			signature:       r.Header.Get(auth.HeaderAuthSig),
+			scopeSignatures: r.Header.Values(auth.HeaderAuthScopeSig),
+			unix:            time.Now().Unix(),
 		}
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		w.Header().Set("Vary", "Accept-Encoding")
@@ -188,7 +192,7 @@ func TestPATRouteTerminatesTokenAndInjectsOnlyVerifiedIdentity(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	const requiredScope = "corvid:temp-mail:delete"
+	const requiredScope = "corvid:temp-mail:manage"
 	store := mustRoutes(t, []config.Route{{
 		Name:         "corvid-delete",
 		Match:        config.Match{Host: "mail.example", PathPrefix: "/api/v1/temp-mailboxes/"},
@@ -209,6 +213,8 @@ func TestPATRouteTerminatesTokenAndInjectsOnlyVerifiedIdentity(t *testing.T) {
 	req := httptest.NewRequest(http.MethodDelete, "http://mail.example/api/v1/temp-mailboxes/opaque-id", nil)
 	req.Host = "mail.example"
 	req.Header.Set("Authorization", "Bearer "+rawPAT)
+	req.Header.Add(auth.HeaderAuthScopeSig, "forged-one")
+	req.Header.Add(auth.HeaderAuthScopeSig, "forged-two")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -221,6 +227,14 @@ func TestPATRouteTerminatesTokenAndInjectsOnlyVerifiedIdentity(t *testing.T) {
 	}
 	if got.subject != "u_test" || got.scope != "profile "+requiredScope || got.signature == "" {
 		t.Fatalf("upstream identity = %+v", got)
+	}
+	if len(got.scopeSignatures) != 1 || got.scopeSignatures[0] == "forged-one" || got.scopeSignatures[0] == "forged-two" {
+		t.Fatalf("upstream PAT scope signatures = %q, want one Sluice-minted value", got.scopeSignatures)
+	}
+	wantCurrent := auth.SignPATScope("identity-hmac-key", "u_test", "profile "+requiredScope, requiredScope, got.unix)
+	wantPrevious := auth.SignPATScope("identity-hmac-key", "u_test", "profile "+requiredScope, requiredScope, got.unix-60)
+	if got.scopeSignatures[0] != wantCurrent && got.scopeSignatures[0] != wantPrevious {
+		t.Fatalf("PAT scope signature = %q, want current or previous window", got.scopeSignatures[0])
 	}
 	if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
 		t.Fatalf("Cache-Control = %q", got)
@@ -262,9 +276,16 @@ func TestPATRouteMissingIntrospectionConfigFailsClosed(t *testing.T) {
 }
 
 func TestNonPATRoutePreservesAuthorizationHeader(t *testing.T) {
-	seen := make(chan string, 1)
+	type observed struct {
+		authorization  string
+		scopeSignature string
+	}
+	seen := make(chan observed, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen <- r.Header.Get("Authorization")
+		seen <- observed{
+			authorization:  r.Header.Get("Authorization"),
+			scopeSignature: r.Header.Get(auth.HeaderAuthScopeSig),
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
@@ -276,13 +297,62 @@ func TestNonPATRoutePreservesAuthorizationHeader(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://api.example/resource", nil)
 	req.Host = "api.example"
 	req.Header.Set("Authorization", "Bearer existing-non-pat-credential")
+	req.Header.Set(auth.HeaderAuthScopeSig, "forged")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", rec.Code)
 	}
-	if got := <-seen; got != "Bearer existing-non-pat-credential" {
-		t.Fatalf("Authorization = %q, existing non-PAT behavior changed", got)
+	got := <-seen
+	if got.authorization != "Bearer existing-non-pat-credential" {
+		t.Fatalf("Authorization = %q, existing non-PAT behavior changed", got.authorization)
+	}
+	if got.scopeSignature != "" {
+		t.Fatalf("non-PAT route forwarded %s = %q, want stripped/absent", auth.HeaderAuthScopeSig, got.scopeSignature)
+	}
+}
+
+func TestNonPATRouteWithIdentityDoesNotInjectScopeSignature(t *testing.T) {
+	type observed struct {
+		identitySignature string
+		scopeSignature    string
+	}
+	seen := make(chan observed, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- observed{
+			identitySignature: r.Header.Get(auth.HeaderAuthSig),
+			scopeSignature:    r.Header.Get(auth.HeaderAuthScopeSig),
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	store := mustRoutes(t, []config.Route{{
+		Name:     "existing-bearer",
+		Match:    config.Match{Host: "api.example", PathPrefix: "/"},
+		Upstream: upstream.URL,
+		Auth:     config.AuthBearer,
+	}})
+	proxy := newReverseProxy(store.Routes()[0], nil, "identity-hmac-key", "", "external", "")
+	req := httptest.NewRequest(http.MethodGet, "http://api.example/resource", nil)
+	req.Host = "api.example"
+	req.Header.Set(auth.HeaderAuthScopeSig, "forged")
+	ctx := auth.ContextWithIdentity(req.Context(), &auth.Identity{
+		Subject: "u_test",
+		Scope:   "profile",
+	})
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req.WithContext(ctx))
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	got := <-seen
+	if got.identitySignature == "" {
+		t.Fatal("verified non-PAT identity did not receive the existing identity signature")
+	}
+	if got.scopeSignature != "" {
+		t.Fatalf("non-PAT identity received %s = %q, want absent", auth.HeaderAuthScopeSig, got.scopeSignature)
 	}
 }
 

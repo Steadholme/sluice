@@ -34,7 +34,8 @@ const (
 //   - strips every client-supplied X-Gateway-Zone and X-Gateway-Zone-Sig header,
 //     then injects the configured zone plus a host-bound signature when configured.
 //   - strips every client-supplied X-Auth-* header, then injects the verified
-//     X-Auth-Subject / X-Auth-Scope from the auth context when present.
+//     X-Auth-Subject / X-Auth-Scope from the auth context when present; PAT
+//     routes also receive a route-bound X-Auth-Scope-Sig.
 //   - on auth="pat" routes only, removes Authorization after introspection so
 //     the raw opaque credential terminates at Sluice.
 //
@@ -84,6 +85,7 @@ func newReverseProxy(route config.Route, mtls *http.Transport, identityHMACKey, 
 			}
 			if id, ok := auth.IdentityFromContext(pr.In.Context()); ok {
 				groups := strings.Join(id.Groups, ",")
+				now := time.Now().Unix()
 				pr.Out.Header.Set(auth.HeaderAuthSubject, id.Subject)
 				pr.Out.Header.Set(auth.HeaderAuthScope, id.Scope)
 				if id.Email != "" {
@@ -95,8 +97,13 @@ func newReverseProxy(route config.Route, mtls *http.Transport, identityHMACKey, 
 				// Cryptographically bind subject+groups to a 1-minute window so a backend
 				// sharing GATEWAY_HMAC_KEY can prove Sluice minted this identity. Key unset
 				// => "" => header omitted, so behavior is unchanged until the key is set.
-				if sig := auth.SignIdentity(identityHMACKey, id.Subject, groups, time.Now().Unix()); sig != "" {
+				if sig := auth.SignIdentity(identityHMACKey, id.Subject, groups, now); sig != "" {
 					pr.Out.Header.Set(auth.HeaderAuthSig, sig)
+				}
+				if route.Auth == config.AuthPAT {
+					if sig := auth.SignPATScope(identityHMACKey, id.Subject, id.Scope, route.RequireScope, now); sig != "" {
+						pr.Out.Header.Set(auth.HeaderAuthScopeSig, sig)
+					}
 				}
 			}
 		},

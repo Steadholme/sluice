@@ -13,13 +13,22 @@ import (
 // the internal network can no longer forge X-Auth-* by dialing the backend directly.
 const HeaderAuthSig = "X-Auth-Sig"
 
+// HeaderAuthScopeSig carries a domain-separated HMAC that binds the verified
+// PAT identity and granted scopes to the scope required by the matched route.
+// Backends must verify it independently from HeaderAuthSig before trusting
+// X-Auth-Scope for PAT authorization.
+const HeaderAuthScopeSig = "X-Auth-Scope-Sig"
+
 // HeaderGatewayZoneSig binds Sluice's injected X-Gateway-Zone, route, and target host to a short
 // time window. It uses a dedicated key and is deliberately separate from HeaderAuthSig so existing
 // backend identity verifiers remain byte-compatible while Estate can authenticate its viewer
 // context without accepting a signature minted for another upstream.
 const HeaderGatewayZoneSig = "X-Gateway-Zone-Sig"
 
-const gatewayZoneSignatureDomain = "holdfast.gateway-zone.v1"
+const (
+	patScopeSignatureDomain    = "holdfast.pat-scope.v1"
+	gatewayZoneSignatureDomain = "holdfast.gateway-zone.v1"
+)
 
 // SigWindow is the epoch-minute bucket a signature is valid for.
 func SigWindow(unix int64) int64 { return unix / 60 }
@@ -40,6 +49,31 @@ func SignIdentity(key, subject, groups string, unix int64) string {
 	mac.Write([]byte(subject))
 	mac.Write([]byte("\n"))
 	mac.Write([]byte(groups))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(strconv.FormatInt(SigWindow(unix), 10)))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// SignPATScope returns the lowercase-hex HMAC-SHA256 over
+//
+//	domain "\n" subject "\n" granted_scope "\n" required_scope "\n" window
+//
+// granted_scope is the exact X-Auth-Scope value returned by PAT introspection;
+// required_scope is the canonical value from the matched route configuration.
+// The separate domain prevents a signature minted for another gateway purpose
+// from being accepted as PAT authorization. An empty key yields "".
+func SignPATScope(key, subject, grantedScope, requiredScope string, unix int64) string {
+	if key == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(patScopeSignatureDomain))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(subject))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(grantedScope))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(requiredScope))
 	mac.Write([]byte("\n"))
 	mac.Write([]byte(strconv.FormatInt(SigWindow(unix), 10)))
 	return hex.EncodeToString(mac.Sum(nil))
