@@ -9,6 +9,7 @@ import (
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
 	"github.com/holdfast/sluice/internal/oidc"
+	"github.com/holdfast/sluice/internal/pat"
 	"github.com/holdfast/sluice/internal/rbac"
 	"github.com/holdfast/sluice/internal/store"
 	"github.com/holdfast/sluice/internal/waf"
@@ -24,6 +25,7 @@ type routeHandler struct {
 // Options carries the optional collaborators the gateway wires onto routes. All
 // are nil-safe so existing call sites stay simple:
 //   - Verifier validates bearer routes (required only if any route is "bearer").
+//   - PATIntrospector validates opaque PAT routes without changing bearer/JWT.
 //   - Provider is the OIDC relying party for "sso" routes; when nil, sso routes
 //     fail closed (503) so the rest of the gateway keeps serving.
 //   - Transport is the mTLS http.Transport used for https upstreams (the internal
@@ -34,11 +36,15 @@ type routeHandler struct {
 //     route is wrapped and the request path is identical. Only routes with
 //     Waf=true are wrapped, so the WAF is opt-in even when the engine is enabled.
 type Options struct {
-	Verifier  *auth.Verifier
-	Provider  *oidc.Provider
-	Transport *http.Transport
-	Auditor   *audit.Emitter
-	WAF       *waf.Engine
+	Verifier *auth.Verifier
+	// PATIntrospector validates opaque Keystone PATs for auth="pat" routes. It is
+	// deliberately separate from Verifier so bearer remains JWT-only. Nil makes
+	// PAT routes fail closed with 503 and does not affect any other route.
+	PATIntrospector pat.Introspector
+	Provider        *oidc.Provider
+	Transport       *http.Transport
+	Auditor         *audit.Emitter
+	WAF             *waf.Engine
 	// Authz is the optional Verdict-backed RBAC authorizer. When nil or disabled,
 	// per-route require_group gating is a no-op (nil-safe via Enabled()).
 	Authz *rbac.Authorizer
@@ -70,12 +76,13 @@ type Options struct {
 
 // Server is the assembled Sluice HTTP handler: /healthz, the gateway-owned
 // /_gw/* OIDC endpoints, route dispatch with per-route reverse proxies, and
-// per-route auth (public / bearer / sso), all wrapped in the structured
+// per-route auth (public / bearer / pat / sso / sso-optional), all wrapped in the structured
 // access-log handler.
 type Server struct {
-	router   *Router
-	provider *oidc.Provider
-	handlers map[string]routeHandler
+	router     *Router
+	provider   *oidc.Provider
+	publicOnly bool
+	handlers   map[string]routeHandler
 }
 
 // NewServer builds the gateway from a route store and the optional collaborators.
@@ -108,9 +115,10 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 		s = store.NewStaticStore(routes)
 	}
 	srv := &Server{
-		router:   NewRouter(s),
-		provider: opts.Provider,
-		handlers: make(map[string]routeHandler),
+		router:     NewRouter(s),
+		provider:   opts.Provider,
+		publicOnly: opts.PublicOnly,
+		handlers:   make(map[string]routeHandler),
 	}
 	for _, route := range routes {
 		proxy := newReverseProxy(route, opts.Transport, opts.GatewayHMACKey, opts.GatewayZoneHMACKey, gatewayZone, opts.SessionCookieName)
@@ -121,6 +129,11 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 		handler := authWrap(route, proxy, opts)
 		if route.Waf {
 			handler = opts.WAF.Middleware(handler)
+		}
+		if route.Auth == config.AuthPAT {
+			// Keep privacy headers outside the optional WAF so every PAT-route
+			// outcome, not just introspection and upstream responses, is no-store.
+			handler = pat.NoStore(handler)
 		}
 		srv.handlers[routeKey(route)] = routeHandler{
 			route:   route,
@@ -135,6 +148,8 @@ func authWrap(route config.Route, proxy http.Handler, opts Options) http.Handler
 	switch route.Auth {
 	case config.AuthBearer:
 		return auth.Middleware(opts.Verifier, proxy, auth.WithAuditor(opts.Auditor))
+	case config.AuthPAT:
+		return pat.Middleware(opts.PATIntrospector, route.RequireScope, proxy)
 	case config.AuthSSO:
 		if opts.Provider == nil {
 			// Fail closed: SSO requested but the relying party is not configured.
@@ -201,6 +216,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Keystone's /internal namespace is a service-to-service surface. A public
+	// instance must reject it before route matching so a host catch-all (notably
+	// the public SSO root route) cannot proxy an internal endpoint. The companion
+	// VPN instance keeps its existing routing behavior, and Sluice's own direct
+	// Keystone client does not pass through this handler.
+	if s.publicOnly && isInternalNamespace(r.URL.Path) {
+		http.NotFound(w, r)
+		return
+	}
+
 	route, ok := s.router.Match(r.Host, r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
@@ -215,6 +240,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	// Record the resolved upstream for the access log.
 	accesslog.SetUpstream(r.Context(), rh.route.Upstream)
 	rh.handler.ServeHTTP(w, r)
+}
+
+func isInternalNamespace(path string) bool {
+	return path == "/internal" || strings.HasPrefix(path, "/internal/")
 }
 
 // routeKey uniquely identifies a route by its match criteria.

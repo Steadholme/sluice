@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,40 @@ func seedRoutes() []config.Route {
 	return []config.Route{
 		{Name: "public-api", Match: config.Match{PathPrefix: "/public"}, Upstream: "http://127.0.0.1:8081", Protected: false},
 		{Name: "protected-api", Match: config.Match{Host: "api.local", PathPrefix: "/api"}, Upstream: "http://127.0.0.1:8082", Protected: true},
+		{Name: "pat-api", Match: config.Match{Host: "api.local", PathPrefix: "/api/v1/delete"}, Upstream: "http://127.0.0.1:8082", Protected: true, Auth: config.AuthPAT, RequireScope: "corvid:temp-mail:delete"},
+	}
+}
+
+func TestStaticStorePreservesPATRouteFields(t *testing.T) {
+	route := config.Route{
+		Name:         "pat-api",
+		Match:        config.Match{Host: "api.local", PathPrefix: "/api/v1/delete"},
+		Upstream:     "http://127.0.0.1:8082",
+		Auth:         config.AuthPAT,
+		RequireScope: "corvid:temp-mail:delete",
+	}
+	store := NewStaticStore([]config.Route{route})
+	got := store.Routes()[0]
+	if got.Auth != config.AuthPAT || got.RequireScope != route.RequireScope {
+		t.Fatalf("PAT route fields changed in StaticStore: %+v", got)
+	}
+}
+
+func TestPostgresRoutePersistenceIncludesRequireScope(t *testing.T) {
+	route := seedRoutes()[2]
+	values := routeValues(route)
+	if len(values) != 9 || values[8] != route.RequireScope {
+		t.Fatalf("routeValues = %#v, want require_scope at position 9", values)
+	}
+	for name, sql := range map[string]string{
+		"schema":  schemaDDL,
+		"migrate": addRequireScopeColumnDDL,
+		"upsert":  upsertRouteSQL,
+		"select":  selectRoutesSQL,
+	} {
+		if !strings.Contains(sql, "require_scope") {
+			t.Errorf("%s SQL omits require_scope: %s", name, sql)
+		}
 	}
 }
 
@@ -39,6 +74,42 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	if _, err := pool.Exec(ctx, "DROP TABLE IF EXISTS routes"); err != nil {
 		t.Fatalf("drop table: %v", err)
 	}
+	// (0) Legacy DB: migrate a routes table that predates require_scope. The old
+	// public row must remain loadable with an empty scope, and the new column must
+	// be physically present before the fresh-db checks below.
+	if _, err := pool.Exec(ctx, `CREATE TABLE routes (
+name TEXT PRIMARY KEY,
+host TEXT NOT NULL DEFAULT '',
+path_prefix TEXT NOT NULL,
+upstream TEXT NOT NULL,
+protected BOOLEAN NOT NULL DEFAULT FALSE,
+auth TEXT NOT NULL DEFAULT '',
+waf BOOLEAN NOT NULL DEFAULT FALSE,
+require_group TEXT NOT NULL DEFAULT ''
+)`); err != nil {
+		t.Fatalf("create legacy routes table: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO routes (name, path_prefix, upstream, auth) VALUES ('legacy-public', '/', 'http://127.0.0.1:8081', 'public')`); err != nil {
+		t.Fatalf("insert legacy route: %v", err)
+	}
+	legacy, err := NewPostgresStore(ctx, dsn, nil)
+	if err != nil {
+		t.Fatalf("NewPostgresStore (legacy migration): %v", err)
+	}
+	if got := legacy.Routes(); len(got) != 1 || got[0].Name != "legacy-public" || got[0].RequireScope != "" {
+		t.Fatalf("legacy migration routes = %+v", got)
+	}
+	legacy.Close()
+	var requireScopeColumns int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'routes' AND column_name = 'require_scope'`).Scan(&requireScopeColumns); err != nil {
+		t.Fatalf("inspect require_scope column: %v", err)
+	}
+	if requireScopeColumns != 1 {
+		t.Fatalf("require_scope columns = %d, want 1", requireScopeColumns)
+	}
+	if _, err := pool.Exec(ctx, "DROP TABLE routes"); err != nil {
+		t.Fatalf("drop migrated table: %v", err)
+	}
 	pool.Close()
 
 	// (1) Fresh DB: migration runs, empty table is seeded, snapshot is parsed.
@@ -49,8 +120,8 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	defer s1.Close()
 
 	routes := s1.Routes()
-	if len(routes) != 2 {
-		t.Fatalf("got %d routes, want 2", len(routes))
+	if len(routes) != 3 {
+		t.Fatalf("got %d routes, want 3", len(routes))
 	}
 	byName := map[string]config.Route{}
 	for _, r := range routes {
@@ -65,6 +136,9 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	if got := byName["public-api"]; got.Protected {
 		t.Errorf("public-api should not be protected: %+v", got)
 	}
+	if got := byName["pat-api"]; got.Auth != config.AuthPAT || got.RequireScope != "corvid:temp-mail:delete" || !got.Protected {
+		t.Errorf("pat-api round-trip mismatch: %+v", got)
+	}
 
 	// (2) Idempotent seed: a second construction over the now-populated table
 	// must NOT duplicate rows and must return the same snapshot. The seed passed
@@ -77,8 +151,8 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		t.Fatalf("NewPostgresStore (reopen): %v", err)
 	}
 	defer s2.Close()
-	if len(s2.Routes()) != 2 {
-		t.Fatalf("reopen returned %d routes, want 2 (table must not be re-seeded)", len(s2.Routes()))
+	if len(s2.Routes()) != 3 {
+		t.Fatalf("reopen returned %d routes, want 3 (table must not be re-seeded)", len(s2.Routes()))
 	}
 	for _, r := range s2.Routes() {
 		if r.Name == "should-not-appear" {

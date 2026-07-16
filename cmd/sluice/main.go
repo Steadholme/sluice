@@ -19,6 +19,7 @@ import (
 	"github.com/holdfast/sluice/internal/gateway"
 	"github.com/holdfast/sluice/internal/mtls"
 	"github.com/holdfast/sluice/internal/oidc"
+	"github.com/holdfast/sluice/internal/pat"
 	"github.com/holdfast/sluice/internal/rbac"
 	"github.com/holdfast/sluice/internal/store"
 	"github.com/holdfast/sluice/internal/waf"
@@ -75,6 +76,7 @@ func main() {
 	}
 	cancel()
 	verifier := auth.NewVerifierWithAudience(jwks, cfg.KeystoneIssuer, cfg.BearerAudience)
+	patIntrospector := buildPATIntrospector(cfg, internalClient, log)
 
 	// Non-blocking audit emitter (env-toggled by AUDIT_ENABLED). When off it is a
 	// no-op; when on it fire-and-forget POSTs security events to Watchtower without
@@ -132,6 +134,7 @@ func main() {
 
 	opts := gateway.Options{
 		Verifier:             verifier,
+		PATIntrospector:      patIntrospector,
 		Provider:             provider,
 		Transport:            mtlsTransport,
 		Auditor:              auditor,
@@ -159,6 +162,7 @@ func main() {
 		"routes", len(routeStore.Routes()),
 		"internal_mtls", mtlsTransport != nil,
 		"oidc_sso", provider != nil,
+		"pat_introspection", patIntrospector != nil,
 		"audit", cfg.AuditEnabled,
 		"waf", cfg.WAFEnabled,
 		"rbac", authz.Enabled(),
@@ -169,6 +173,28 @@ func main() {
 		log.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+// buildPATIntrospector wires opaque-PAT auth whenever its explicit endpoint is
+// configured, even if the initial static seed has no PAT route. PostgreSQL can
+// hot-add such a route later, and the rebuilt handler must already have a live
+// introspector. A missing endpoint keeps PAT routes fail-closed (503) while
+// bearer/public/SSO routes are unaffected.
+func buildPATIntrospector(cfg *config.Config, internalClient *http.Client, log *slog.Logger) pat.Introspector {
+	if strings.TrimSpace(cfg.PATIntrospectionURL) == "" {
+		return nil
+	}
+	introspector, err := pat.NewKeystoneIntrospector(pat.Config{
+		Endpoint:     cfg.PATIntrospectionURL,
+		ClientID:     cfg.GWClientID,
+		ClientSecret: cfg.GWClientSecret,
+		Client:       internalClient,
+	})
+	if err != nil {
+		log.Error("opaque PAT introspection unavailable; pat routes will 503", "error", err)
+		return nil
+	}
+	return introspector
 }
 
 // apexHost is the registrable apex implied by the cookie domain (e.g. .w33d.xyz

@@ -26,6 +26,7 @@ func TestMiddlewareRejectsBadAuth(t *testing.T) {
 		{"malformed-non-bearer", "Basic abc123"},
 		{"bearer-no-token", "Bearer "},
 		{"bad-token", "Bearer not.a.valid.jwt"},
+		{"opaque-pat-is-not-a-jwt", "Bearer pat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
 	}
 
 	for _, tc := range cases {

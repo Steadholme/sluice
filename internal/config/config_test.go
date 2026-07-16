@@ -201,8 +201,9 @@ func TestRouteAuthModeNormalization(t *testing.T) {
 		{"empty+protected->bearer", Route{Name: "b", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Protected: true}, AuthBearer, true},
 		{"explicit public", Route{Name: "c", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "public", Protected: true}, AuthPublic, false},
 		{"explicit bearer", Route{Name: "d", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "BEARER"}, AuthBearer, true},
-		{"explicit sso syncs protected", Route{Name: "e", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "sso"}, AuthSSO, true},
-		{"explicit sso-optional validates", Route{Name: "f", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "sso-optional"}, AuthSSOOptional, true},
+		{"explicit pat syncs protected", Route{Name: "e", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "PAT", RequireScope: "corvid:temp-mail:delete"}, AuthPAT, true},
+		{"explicit sso syncs protected", Route{Name: "f", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "sso"}, AuthSSO, true},
+		{"explicit sso-optional validates", Route{Name: "g", Match: Match{PathPrefix: "/"}, Upstream: "http://u:1", Auth: "sso-optional"}, AuthSSOOptional, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -228,6 +229,55 @@ func TestRouteAuthModeRejectsUnknown(t *testing.T) {
 	}
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected error for unknown auth mode")
+	}
+}
+
+func TestPATRouteRequiresExactlyOneScope(t *testing.T) {
+	cases := []struct {
+		name  string
+		auth  string
+		scope string
+		ok    bool
+	}{
+		{name: "pat-exact", auth: AuthPAT, scope: "corvid:temp-mail:delete", ok: true},
+		{name: "pat-trims-outer-space", auth: AuthPAT, scope: "  corvid:temp-mail:delete  ", ok: true},
+		{name: "pat-empty", auth: AuthPAT, scope: ""},
+		{name: "pat-multiple", auth: AuthPAT, scope: "scope:one scope:two"},
+		{name: "public-must-not-accept", auth: AuthPublic, scope: "scope:one"},
+		{name: "public-must-not-silently-accept-whitespace", auth: AuthPublic, scope: "   "},
+		{name: "bearer-must-not-accept", auth: AuthBearer, scope: "scope:one"},
+		{name: "sso-must-not-accept", auth: AuthSSO, scope: "scope:one"},
+		{name: "sso-optional-must-not-accept", auth: AuthSSOOptional, scope: "scope:one"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{Routes: []Route{{
+				Name:         "route",
+				Match:        Match{PathPrefix: "/"},
+				Upstream:     "http://upstream:8080",
+				Auth:         tc.auth,
+				RequireScope: tc.scope,
+			}}}
+			err := c.Validate()
+			if tc.ok && err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("Validate unexpectedly accepted invalid auth/require_scope combination")
+			}
+			if tc.ok && c.Routes[0].RequireScope != "corvid:temp-mail:delete" {
+				t.Fatalf("RequireScope = %q", c.Routes[0].RequireScope)
+			}
+		})
+	}
+}
+
+func TestApplyEnvPATIntrospectionURL(t *testing.T) {
+	t.Setenv(EnvPATIntrospectionURL, "  https://keystone:8443/internal/v1/pats/introspect  ")
+	c := minimalValid()
+	c.ApplyEnv()
+	if got := c.PATIntrospectionURL; got != "https://keystone:8443/internal/v1/pats/introspect" {
+		t.Fatalf("PATIntrospectionURL = %q", got)
 	}
 }
 

@@ -113,6 +113,12 @@ func TestFingerprint(t *testing.T) {
 	if fingerprint(a) == fingerprint(changed) {
 		t.Fatal("changing an upstream did not change the fingerprint")
 	}
+
+	patA := []config.Route{{Name: "pat", Match: config.Match{Host: "a", PathPrefix: "/api"}, Upstream: "http://u1", Auth: config.AuthPAT, RequireScope: "scope:one"}}
+	patB := []config.Route{{Name: "pat", Match: config.Match{Host: "a", PathPrefix: "/api"}, Upstream: "http://u1", Auth: config.AuthPAT, RequireScope: "scope:two"}}
+	if fingerprint(patA) == fingerprint(patB) {
+		t.Fatal("changing require_scope did not change the fingerprint")
+	}
 }
 
 type mutStore struct {

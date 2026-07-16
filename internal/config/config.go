@@ -81,6 +81,10 @@ const (
 	// the INTERNAL Keystone (e.g. http://keystone:8080) to avoid a TLS loopback.
 	EnvDiscoveryURL = "OIDC_DISCOVERY_URL" // overrides discovery_url (discovery doc fetch URL)
 	EnvJWKSFetchURL = "JWKS_FETCH_URL"     // direct jwks_uri; bypasses discovery entirely
+	// EnvPATIntrospectionURL is the explicit INTERNAL Keystone endpoint used only
+	// by auth="pat" routes. It is never derived from the public issuer: leaving it
+	// unset keeps PAT routes fail-closed without changing any other auth mode.
+	EnvPATIntrospectionURL = "PAT_INTROSPECTION_URL"
 )
 
 // TLS termination modes selectable via EnvTLSMode.
@@ -98,13 +102,15 @@ const (
 
 // Per-route authentication modes (Route.Auth). They generalise the legacy
 // boolean Protected: "public" == not protected, "bearer" == the existing
-// forward-auth (Authorization: Bearer RS256 JWT) API path, "sso" == the OIDC
+// forward-auth (Authorization: Bearer RS256 JWT) API path, "pat" == isolated
+// opaque-token introspection with an exact required scope, "sso" == the OIDC
 // BROWSER SSO path (gateway session cookie, redirect to Keystone login), and
 // "sso-optional" == anonymous pass-through with identity injection only when a
 // valid gateway session already exists.
 const (
 	AuthPublic      = "public"
 	AuthBearer      = "bearer"
+	AuthPAT         = "pat"
 	AuthSSO         = "sso"
 	AuthSSOOptional = "sso-optional"
 )
@@ -213,8 +219,9 @@ type Route struct {
 	Upstream  string `json:"upstream"`
 	Protected bool   `json:"protected"`
 
-	// Auth is the per-route authentication mode: "public" | "bearer" | "sso" |
-	// "sso-optional".
+	// Auth is the per-route authentication mode: "public" | "bearer" | "pat" |
+	// "sso" | "sso-optional". PAT is deliberately separate from bearer: it
+	// introspects an opaque Keystone PAT and never changes the JWT verifier.
 	// It is optional and normalised by Validate: an empty value is derived from
 	// the legacy Protected boolean (true -> "bearer", false -> "public"), so
 	// existing configs and route rows keep their exact behavior. Protected is in
@@ -235,6 +242,11 @@ type Route struct {
 	// is on — keeping the ingress behavior identical.
 	RequireGroup string `json:"require_group,omitempty"`
 
+	// RequireScope is the single exact scope required by an auth="pat" route.
+	// It is mandatory for PAT routes and rejected on every other auth mode, so a
+	// typo cannot silently widen a route or create ambiguous mixed auth semantics.
+	RequireScope string `json:"require_scope,omitempty"`
+
 	// upstreamURL is the parsed form of Upstream, populated by Validate so the
 	// data path never re-parses on the hot path. Unexported so it is not part
 	// of the JSON surface.
@@ -247,13 +259,17 @@ func (r *Route) UpstreamURL() *url.URL { return r.upstreamURL }
 
 // Config is the top-level Sluice configuration.
 type Config struct {
-	ListenAddr           string        `json:"listen_addr"`
-	KeystoneIssuer       string        `json:"keystone_issuer"`
+	ListenAddr     string `json:"listen_addr"`
+	KeystoneIssuer string `json:"keystone_issuer"`
 	// BearerAudience, when non-empty, is the aud that bearer access tokens must
 	// carry (SLUICE_AUDIENCE). Empty keeps the v0 behavior: aud is not enforced.
-	BearerAudience       string        `json:"bearer_audience"`
-	DiscoveryURL         string        `json:"discovery_url"`
-	JWKSFetchURL         string        `json:"jwks_fetch_url"`
+	BearerAudience string `json:"bearer_audience"`
+	DiscoveryURL   string `json:"discovery_url"`
+	JWKSFetchURL   string `json:"jwks_fetch_url"`
+	// PATIntrospectionURL is the explicit internal Keystone opaque-PAT
+	// introspection endpoint. Empty is permitted at startup; PAT routes then
+	// return 503 while all existing auth modes retain their behavior.
+	PATIntrospectionURL  string        `json:"pat_introspection_url"`
 	JWKSRefreshInterval  time.Duration `json:"jwks_refresh_interval"`
 	JWKSRotationCooldown time.Duration `json:"jwks_rotation_cooldown"`
 
@@ -406,6 +422,9 @@ func (c *Config) ApplyEnv() {
 	}
 	if v := os.Getenv(EnvJWKSFetchURL); v != "" {
 		c.JWKSFetchURL = v
+	}
+	if v := os.Getenv(EnvPATIntrospectionURL); v != "" {
+		c.PATIntrospectionURL = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvJWKSRotationCooldown); v != "" {
 		// Go duration string (e.g. "5s"); a malformed value is treated as unset so
@@ -640,6 +659,9 @@ func (c *Config) Validate() error {
 		if err := normalizeAuth(r); err != nil {
 			return fmt.Errorf("route %q: %w", routeName(r, i), err)
 		}
+		if err := validateRouteScope(r); err != nil {
+			return fmt.Errorf("route %q: %w", routeName(r, i), err)
+		}
 	}
 	return nil
 }
@@ -658,11 +680,34 @@ func normalizeAuth(r *Route) error {
 		}
 	}
 	switch r.Auth {
-	case AuthPublic, AuthBearer, AuthSSO, AuthSSOOptional:
+	case AuthPublic, AuthBearer, AuthPAT, AuthSSO, AuthSSOOptional:
 	default:
-		return fmt.Errorf("invalid auth %q (want %s|%s|%s|%s)", r.Auth, AuthPublic, AuthBearer, AuthSSO, AuthSSOOptional)
+		return fmt.Errorf("invalid auth %q (want %s|%s|%s|%s|%s)", r.Auth, AuthPublic, AuthBearer, AuthPAT, AuthSSO, AuthSSOOptional)
 	}
 	r.Protected = r.Auth != AuthPublic
+	return nil
+}
+
+// validateRouteScope locks require_scope to the PAT auth mode. A route accepts
+// exactly one scope token (no whitespace-separated alternatives); the
+// introspector later checks exact membership in Keystone's space-delimited
+// scope response.
+func validateRouteScope(r *Route) error {
+	raw := r.RequireScope
+	if r.Auth != AuthPAT {
+		if raw != "" {
+			return fmt.Errorf("require_scope is only valid with auth=%s", AuthPAT)
+		}
+		return nil
+	}
+	r.RequireScope = strings.TrimSpace(raw)
+	if r.RequireScope == "" {
+		return fmt.Errorf("auth=%s requires require_scope", AuthPAT)
+	}
+	fields := strings.Fields(r.RequireScope)
+	if len(fields) != 1 || fields[0] != r.RequireScope {
+		return fmt.Errorf("require_scope must be exactly one scope token")
+	}
 	return nil
 }
 

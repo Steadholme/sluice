@@ -97,6 +97,7 @@ func fingerprint(routes []config.Route) string {
 			r.Auth,
 			strconv.FormatBool(r.Waf),
 			r.RequireGroup,
+			r.RequireScope,
 		}, "\x1f"))
 	}
 	sort.Strings(keys)

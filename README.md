@@ -62,6 +62,7 @@ go run ./cmd/sluice -config config.json
 | `OIDC_ISSUER` | SSO 用的**公网** issuer（authorize 跳转 + id_token `iss`/`aud` 校验） | 取 `KEYSTONE_ISSUER` |
 | `GW_CLIENT_ID` | 网关在 Keystone 注册的 OIDC `client_id` | 空 |
 | `GW_CLIENT_SECRET` | 网关 client secret（token 端点 `client_secret_post`） | 空 |
+| `PAT_INTROSPECTION_URL` | `auth=pat` 使用的显式 Keystone 内网 introspection URL（例如 `https://keystone:8443/internal/v1/pats/introspect`） | 空（PAT route fail-closed `503`） |
 | `GW_REDIRECT_URI` | **公网** 回调地址，须为 `https://id.w33d.xyz/_gw/auth/callback` | 空 |
 | `GW_TOKEN_URL` | **内网** token 端点（开 mTLS 时 `https://keystone:8443/token`，否则 `http://keystone:8080/token`） | 空 |
 | `GW_SESSION_TTL` | 网关浏览器会话有效期（Go duration，如 `8h`） | `8h` |
@@ -143,19 +144,26 @@ go run ./cmd/sluice -config config.json
 `redirect_uri` 恒为 `https://id.w33d.xyz/_gw/auth/callback`。autocert 会按此路由表逐主机
 按需签发 LE 证书。
 
-### 路由鉴权三模式：`public` / `bearer` / `sso`
+### 路由鉴权模式：`public` / `bearer` / `pat` / `sso` / `sso-optional`
 
 每条路由新增可选 `auth` 字段，泛化原来的 `protected` 布尔：
 
 - **`public`**：不鉴权，直接反代（等价 `protected:false`）。
 - **`bearer`**：现有 **API forward-auth**——要求 `Authorization: Bearer <RS256 JWT>`，
   校验通过注入 `X-Auth-*`，失败 `401`（等价 `protected:true`）。**行为完全不变。**
+- **`pat`**：隔离的 opaque PAT data plane。路由必须配置单个 `require_scope`；Sluice
+  对每个请求用现有 `GW_CLIENT_ID` / `GW_CLIENT_SECRET` Basic auth，经现有内网 mTLS
+  client 向显式 `PAT_INTROSPECTION_URL` POST `token` form。inactive 返回 `401`，缺 exact
+  scope 返回 `403`，依赖故障/非 `200`/坏响应返回 `503`。原始 PAT 不会进入上游，所有
+  outcome 强制 `Cache-Control: private, no-store` 与 `Vary: Authorization`。
 - **`sso`**：新增 **浏览器 SSO**——见下。
+- **`sso-optional`**：允许匿名读取；存在有效网关会话时才注入 SSO Identity。
 
 向后兼容：`auth` 留空时由 `protected` 派生（`true→bearer`、`false→public`），
 因此既有配置文件与 Postgres 路由行**零改动、行为不变**；显式写 `auth` 即覆盖。
-Postgres `routes` 表自动新增 `auth` 列（旧库经幂等 `ALTER ... ADD COLUMN IF NOT
-EXISTS` 回填，旧行 `auth=''` 仍按 `protected` 派生）。
+Postgres `routes` 表自动新增 `auth` 与 `require_scope` 列（旧库经幂等 `ALTER ... ADD
+COLUMN IF NOT EXISTS` 回填，旧行 `auth=''` 仍按 `protected` 派生，`require_scope=''`
+不会改变非 PAT route）。非 PAT mode 配置 `require_scope` 会直接校验失败，不能静默忽略。
 
 ### OIDC 浏览器 SSO（`GW_OIDC=on`）
 
@@ -318,6 +326,7 @@ internal/auth/jwks.go         OIDC discovery + JWKS 抓取 + RSA 公钥重建 + 
 Dockerfile / .dockerignore    多阶段静态构建 -> scratch 非 root 运行，-healthcheck 驱动 HEALTHCHECK
 internal/auth/verifier.go     基于 golang-jwt 的 RS256/iss/exp 校验
 internal/auth/middleware.go   forward-auth 中间件 + Identity（含 Email）+ ContextWithIdentity + 审计埋点（WithAuditor）
+internal/pat/                 独立 opaque PAT introspection、中间件、exact scope 与 PAT route no-store 边界
 internal/audit/audit.go       非阻塞审计发射器：有界 channel + 后台 worker，即发即忘 POST 到 Watchtower，满/宕机即丢弃
 internal/mtls/mtls.go         内网 mTLS 客户端 transport/Client 构建（Keyward 客户端证书 + root CA + ServerName）
 internal/oidc/oidc.go         OIDC 浏览器 SSO Relying Party：Middleware、/_gw 回调与登出、PKCE、域作用域 __Secure-gw cookie（跨子域）、完整 original_url 返回 + 开放重定向防护、id_token 校验
@@ -326,6 +335,6 @@ internal/oidc/postgres.go     gw_sessions / gw_oauth_state 的 Postgres 实现�
 internal/gateway/router.go    路由匹配（Host 为主键的子域名 vhost + 主机内最长前缀）
 internal/gateway/proxy.go     基于 ReverseProxy 的流式代理（X-Forwarded-* 注入、保留 Host、X-Auth-* 剥离/注入、https 上游挂 mTLS）
 internal/gateway/tls.go       file 模式证书加载、acme autocert.Manager（动态多主机 HostPolicy + RouteHostSet）、:80 HTTP→HTTPS 跳转
-internal/gateway/server.go    HTTP handler 组装（healthz、/_gw 拦截、路由分发、public/bearer/sso 三模式鉴权、访问日志）
+internal/gateway/server.go    HTTP handler 组装（healthz、/_gw 拦截、路由分发、五种隔离鉴权模式、访问日志）
 internal/accesslog/           slog JSON 访问日志包裹器
 ```

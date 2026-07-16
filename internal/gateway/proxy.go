@@ -35,6 +35,8 @@ const (
 //     then injects the configured zone plus a host-bound signature when configured.
 //   - strips every client-supplied X-Auth-* header, then injects the verified
 //     X-Auth-Subject / X-Auth-Scope from the auth context when present.
+//   - on auth="pat" routes only, removes Authorization after introspection so
+//     the raw opaque credential terminates at Sluice.
 //
 // Public routes have no auth context, so all X-Auth-* headers are simply
 // stripped and never re-added.
@@ -63,6 +65,13 @@ func newReverseProxy(route config.Route, mtls *http.Transport, identityHMACKey, 
 			}
 
 			stripAuthHeaders(pr.Out.Header)
+			// Opaque PATs terminate at Sluice. Unlike the existing bearer/JWT path,
+			// a PAT route must never forward its raw Authorization credential to the
+			// upstream; identity and scope are conveyed only through Sluice-minted
+			// X-Auth-* headers (and the optional identity HMAC).
+			if route.Auth == config.AuthPAT {
+				pr.Out.Header.Del("Authorization")
+			}
 			// Non-SSO routes are untrusted from the estate's point of view — most
 			// importantly the public SiteFlow-deployed sites served on *.w33d.xyz,
 			// which run arbitrary repo-owner code (incl. serverless functions). The

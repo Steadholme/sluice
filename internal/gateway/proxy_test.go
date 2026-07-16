@@ -6,16 +6,27 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
 	"github.com/holdfast/sluice/internal/oidc"
+	"github.com/holdfast/sluice/internal/pat"
 	"github.com/holdfast/sluice/internal/rbac"
 )
 
 type unusedKeyResolver struct{}
+
+type gatewayPATIntrospector struct {
+	result pat.Result
+	err    error
+}
+
+func (i gatewayPATIntrospector) Introspect(context.Context, string) (pat.Result, error) {
+	return i.result, i.err
+}
 
 func (unusedKeyResolver) KeyByKID(context.Context, string) (*rsa.PublicKey, error) {
 	return nil, errors.New("unused key resolver")
@@ -154,4 +165,134 @@ func TestSSOOptionalAnonymousRoutePassesThroughWithoutGateOrSpoofedIdentity(t *t
 	if got := <-seenSubject; got != "" {
 		t.Fatalf("%s reached upstream as %q, want stripped/empty", auth.HeaderAuthSubject, got)
 	}
+}
+
+func TestPATRouteTerminatesTokenAndInjectsOnlyVerifiedIdentity(t *testing.T) {
+	type observed struct {
+		authorization string
+		subject       string
+		scope         string
+		signature     string
+	}
+	seen := make(chan observed, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- observed{
+			authorization: r.Header.Get("Authorization"),
+			subject:       r.Header.Get(auth.HeaderAuthSubject),
+			scope:         r.Header.Get(auth.HeaderAuthScope),
+			signature:     r.Header.Get(auth.HeaderAuthSig),
+		}
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	const requiredScope = "corvid:temp-mail:delete"
+	store := mustRoutes(t, []config.Route{{
+		Name:         "corvid-delete",
+		Match:        config.Match{Host: "mail.example", PathPrefix: "/api/v1/temp-mailboxes/"},
+		Upstream:     upstream.URL,
+		Auth:         config.AuthPAT,
+		RequireScope: requiredScope,
+	}})
+	handler := NewServer(store, Options{
+		PATIntrospector: gatewayPATIntrospector{result: pat.Result{
+			Active:  true,
+			Subject: "u_test",
+			Scope:   "profile " + requiredScope,
+		}},
+		GatewayHMACKey: "identity-hmac-key",
+	}).Handler()
+
+	const rawPAT = "pat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	req := httptest.NewRequest(http.MethodDelete, "http://mail.example/api/v1/temp-mailboxes/opaque-id", nil)
+	req.Host = "mail.example"
+	req.Header.Set("Authorization", "Bearer "+rawPAT)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	got := <-seen
+	if got.authorization != "" {
+		t.Fatalf("raw PAT reached upstream in Authorization: %q", got.authorization)
+	}
+	if got.subject != "u_test" || got.scope != "profile "+requiredScope || got.signature == "" {
+		t.Fatalf("upstream identity = %+v", got)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if !headerHasValue(rec.Header().Values("Vary"), "Accept-Encoding") || !headerHasValue(rec.Header().Values("Vary"), "Authorization") {
+		t.Fatalf("Vary = %q", rec.Header().Values("Vary"))
+	}
+}
+
+func TestPATRouteMissingIntrospectionConfigFailsClosed(t *testing.T) {
+	upstreamHit := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		upstreamHit = true
+	}))
+	defer upstream.Close()
+	store := mustRoutes(t, []config.Route{{
+		Name:         "corvid-delete",
+		Match:        config.Match{Host: "mail.example", PathPrefix: "/api/"},
+		Upstream:     upstream.URL,
+		Auth:         config.AuthPAT,
+		RequireScope: "corvid:temp-mail:delete",
+	}})
+	handler := NewServer(store, Options{}).Handler()
+	req := httptest.NewRequest(http.MethodDelete, "http://mail.example/api/resource", nil)
+	req.Host = "mail.example"
+	req.Header.Set("Authorization", "Bearer pat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if upstreamHit {
+		t.Fatal("PAT route reached upstream without introspection configuration")
+	}
+	if rec.Header().Get("Cache-Control") != "private, no-store" || !headerHasValue(rec.Header().Values("Vary"), "Authorization") {
+		t.Fatalf("privacy headers: Cache-Control=%q Vary=%q", rec.Header().Get("Cache-Control"), rec.Header().Values("Vary"))
+	}
+}
+
+func TestNonPATRoutePreservesAuthorizationHeader(t *testing.T) {
+	seen := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	store := mustRoutes(t, []config.Route{{
+		Name: "existing-public", Match: config.Match{Host: "api.example", PathPrefix: "/"},
+		Upstream: upstream.URL, Auth: config.AuthPublic,
+	}})
+	handler := NewServer(store, Options{}).Handler()
+	req := httptest.NewRequest(http.MethodGet, "http://api.example/resource", nil)
+	req.Host = "api.example"
+	req.Header.Set("Authorization", "Bearer existing-non-pat-credential")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	if got := <-seen; got != "Bearer existing-non-pat-credential" {
+		t.Fatalf("Authorization = %q, existing non-PAT behavior changed", got)
+	}
+}
+
+func headerHasValue(values []string, want string) bool {
+	for _, value := range values {
+		for _, field := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(field), want) {
+				return true
+			}
+		}
+	}
+	return false
 }

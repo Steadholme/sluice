@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS routes (
     protected   BOOLEAN NOT NULL DEFAULT FALSE,
     auth          TEXT    NOT NULL DEFAULT '',
     waf           BOOLEAN NOT NULL DEFAULT FALSE,
-    require_group TEXT    NOT NULL DEFAULT ''
+    require_group TEXT    NOT NULL DEFAULT '',
+    require_scope TEXT    NOT NULL DEFAULT ''
 )`
 
 // addAuthColumnDDL backfills the auth column on a pre-existing routes table (one
@@ -52,13 +53,19 @@ const addWafColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS waf BOOLEAN
 // explicitly set, keeping behavior unchanged.
 const addRequireGroupColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS require_group TEXT NOT NULL DEFAULT ''`
 
+// addRequireScopeColumnDDL adds the isolated PAT authorization requirement.
+// Existing rows default to empty, which is valid for every pre-PAT auth mode;
+// config validation rejects empty scope only when a route explicitly selects
+// auth="pat".
+const addRequireScopeColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS require_scope TEXT NOT NULL DEFAULT ''`
+
 const (
 	countRoutesSQL = `SELECT count(*) FROM routes`
-	upsertRouteSQL = `INSERT INTO routes (name, host, path_prefix, upstream, protected, auth, waf, require_group)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-ON CONFLICT (name) DO NOTHING`
-	selectRoutesSQL = `SELECT name, host, path_prefix, upstream, protected, auth, waf, require_group
-FROM routes ORDER BY name`
+	upsertRouteSQL = `INSERT INTO routes (name, host, path_prefix, upstream, protected, auth, waf, require_group, require_scope)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	ON CONFLICT (name) DO NOTHING`
+	selectRoutesSQL = `SELECT name, host, path_prefix, upstream, protected, auth, waf, require_group, require_scope
+	FROM routes ORDER BY name`
 )
 
 // PostgresStore is a RouteStore backed by a portable PostgreSQL routes table.
@@ -196,6 +203,9 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	if _, err := s.pool.Exec(ctx, addRequireGroupColumnDDL); err != nil {
 		return fmt.Errorf("store: add require_group column: %w", err)
 	}
+	if _, err := s.pool.Exec(ctx, addRequireScopeColumnDDL); err != nil {
+		return fmt.Errorf("store: add require_scope column: %w", err)
+	}
 	return nil
 }
 
@@ -211,7 +221,7 @@ func (s *PostgresStore) seedIfEmpty(ctx context.Context, seed []config.Route) er
 	}
 	batch := &pgx.Batch{}
 	for _, r := range seed {
-		batch.Queue(upsertRouteSQL, r.Name, r.Match.Host, r.Match.PathPrefix, r.Upstream, r.Protected, r.Auth, r.Waf, r.RequireGroup)
+		batch.Queue(upsertRouteSQL, routeValues(r)...)
 	}
 	br := s.pool.SendBatch(ctx, batch)
 	defer br.Close()
@@ -253,7 +263,7 @@ func (s *PostgresStore) queryRoutes(ctx context.Context) ([]config.Route, error)
 	var loaded []config.Route
 	for rows.Next() {
 		var r config.Route
-		if err := rows.Scan(&r.Name, &r.Match.Host, &r.Match.PathPrefix, &r.Upstream, &r.Protected, &r.Auth, &r.Waf, &r.RequireGroup); err != nil {
+		if err := rows.Scan(&r.Name, &r.Match.Host, &r.Match.PathPrefix, &r.Upstream, &r.Protected, &r.Auth, &r.Waf, &r.RequireGroup, &r.RequireScope); err != nil {
 			return nil, fmt.Errorf("store: scan route: %w", err)
 		}
 		loaded = append(loaded, r)
@@ -271,4 +281,21 @@ func (s *PostgresStore) queryRoutes(ctx context.Context) ([]config.Route, error)
 		return nil, fmt.Errorf("store: validate loaded routes: %w", err)
 	}
 	return tmp.Routes, nil
+}
+
+// routeValues is the canonical persistence order for seed/upsert writes. Keeping
+// it in one helper makes new route authorization fields mechanically testable
+// and prevents a field from being present in SELECT but omitted from INSERT.
+func routeValues(r config.Route) []any {
+	return []any{
+		r.Name,
+		r.Match.Host,
+		r.Match.PathPrefix,
+		r.Upstream,
+		r.Protected,
+		r.Auth,
+		r.Waf,
+		r.RequireGroup,
+		r.RequireScope,
+	}
 }
