@@ -105,6 +105,13 @@ func dynamicHostPolicy(allowed AllowedHosts) autocert.HostPolicy {
 func RedirectHTTPSHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		target := "https://" + stripPort(r.Host) + r.URL.RequestURI()
+		if isRSVPCapabilityPath(r.URL.Path) {
+			w.Header().Set("Referrer-Policy", "no-referrer")
+			w.Header().Set("Cache-Control", "private, no-store")
+			w.Header().Set("Location", target)
+			w.WriteHeader(http.StatusMovedPermanently)
+			return
+		}
 		http.Redirect(w, r, target, http.StatusMovedPermanently)
 	})
 }

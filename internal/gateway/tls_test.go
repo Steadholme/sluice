@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/holdfast/sluice/internal/config"
@@ -23,6 +24,11 @@ func TestRedirectHTTPSHandler(t *testing.T) {
 		{"bare_host", "id.w33d.xyz", "/login?next=/account", "https://id.w33d.xyz/login?next=/account"},
 		{"host_with_port", "id.w33d.xyz:80", "/authorize", "https://id.w33d.xyz/authorize"},
 		{"root", "id.w33d.xyz", "/", "https://id.w33d.xyz/"},
+		{"share_room_asset", "drive.w33d.xyz", "/s/share-room.css", "https://drive.w33d.xyz/s/share-room.css"},
+		{"existing_review_capability", "blog.w33d.xyz", "/review/token", "https://blog.w33d.xyz/review/token"},
+		{"existing_receipt_capability", "drive.w33d.xyz", "/receipts/token", "https://drive.w33d.xyz/receipts/token"},
+		{"existing_share_capability", "drive.w33d.xyz", "/s/token", "https://drive.w33d.xyz/s/token"},
+		{"existing_upload_capability", "drive.w33d.xyz", "/u/token", "https://drive.w33d.xyz/u/token"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -36,6 +42,77 @@ func TestRedirectHTTPSHandler(t *testing.T) {
 			}
 			if got := rec.Header().Get("Location"); got != tc.want {
 				t.Errorf("Location = %q, want %q", got, tc.want)
+			}
+			if got := rec.Header().Get("Referrer-Policy"); got != "" {
+				t.Errorf("Referrer-Policy = %q, want existing redirect behavior", got)
+			}
+			if got := rec.Header().Get("Cache-Control"); got != "" {
+				t.Errorf("Cache-Control = %q, want existing redirect behavior", got)
+			}
+			if rec.Body.Len() == 0 {
+				t.Error("redirect body is empty; want existing http.Redirect body")
+			}
+		})
+	}
+}
+
+func TestRedirectHTTPSHandlerProtectsRSVPCapability(t *testing.T) {
+	const bearer = "RAW-RSVP-CAPABILITY-SENTINEL"
+	tests := []struct {
+		name         string
+		host         string
+		uri          string
+		wantLocation string
+		bearer       string
+	}{
+		{
+			name:         "nested bearer and host port",
+			host:         "CAL.W33D.XYZ:80",
+			uri:          "/rsvp/" + bearer + "/reply/accepted?next=%2Fcalendar",
+			wantLocation: "https://CAL.W33D.XYZ/rsvp/" + bearer + "/reply/accepted?next=%2Fcalendar",
+			bearer:       bearer,
+		},
+		{
+			name:         "exact empty capability tail",
+			host:         "cal.w33d.xyz",
+			uri:          "/rsvp/",
+			wantLocation: "https://cal.w33d.xyz/rsvp/",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://"+test.host+test.uri, nil)
+			req.Host = test.host
+			rec := httptest.NewRecorder()
+			RedirectHTTPSHandler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusMovedPermanently {
+				t.Fatalf("status = %d, want 301", rec.Code)
+			}
+			if got := rec.Header().Get("Location"); got != test.wantLocation {
+				t.Fatalf("Location = %q, want exact same-URI redirect %q", got, test.wantLocation)
+			}
+			if got := rec.Header().Get("Referrer-Policy"); got != "no-referrer" {
+				t.Fatalf("Referrer-Policy = %q, want no-referrer", got)
+			}
+			if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
+				t.Fatalf("Cache-Control = %q, want private, no-store", got)
+			}
+			if got := rec.Body.String(); got != "" {
+				t.Fatalf("body = %q, want empty capability redirect body", got)
+			}
+			if test.bearer != "" {
+				for name, values := range rec.Header() {
+					if strings.EqualFold(name, "Location") {
+						continue
+					}
+					if strings.Contains(strings.Join(values, "\n"), test.bearer) {
+						t.Fatalf("response header %q leaked RSVP capability: %q", name, values)
+					}
+				}
+				if count := strings.Count(rec.Header().Get("Location"), test.bearer); count != 1 {
+					t.Fatalf("Location contains RSVP capability %d times, want exactly once", count)
+				}
 			}
 		})
 	}
@@ -143,4 +220,98 @@ func TestNewACMEManagerStagingDirectory(t *testing.T) {
 	if prod.Client != nil {
 		t.Errorf("Client should be nil without ACME_DIRECTORY_URL, got %+v", prod.Client)
 	}
+}
+
+func TestNewACMEManagerHTTPHandlerComposesChallengeAndRSVPFallback(t *testing.T) {
+	const host = "cal.w33d.xyz"
+	const challengeToken = "deterministic-http-01-token"
+	const challengeBody = challengeToken + ".deterministic-key-authorization"
+
+	manager := NewACMEManager(
+		&config.Config{ACMECacheDir: t.TempDir()},
+		staticHosts(host),
+	)
+	if err := manager.Cache.Put(
+		context.Background(),
+		challengeToken+"+http-01",
+		[]byte(challengeBody),
+	); err != nil {
+		t.Fatalf("seed ACME HTTP-01 cache: %v", err)
+	}
+	handler := manager.HTTPHandler(RedirectHTTPSHandler())
+
+	t.Run("cached challenge passthrough", func(t *testing.T) {
+		req := httptest.NewRequest(
+			http.MethodGet,
+			"http://"+host+"/.well-known/acme-challenge/"+challengeToken,
+			nil,
+		)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if got := rec.Body.String(); got != challengeBody {
+			t.Fatalf("body = %q, want cached challenge response %q", got, challengeBody)
+		}
+		if got := rec.Header().Get("Location"); got != "" {
+			t.Fatalf("Location = %q, want ACME challenge passthrough", got)
+		}
+	})
+
+	t.Run("unknown challenge stays 404", func(t *testing.T) {
+		req := httptest.NewRequest(
+			http.MethodGet,
+			"http://"+host+"/.well-known/acme-challenge/unknown-token",
+			nil,
+		)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+		if got := rec.Header().Get("Location"); got != "" {
+			t.Fatalf("Location = %q, want unknown challenge handled without fallback", got)
+		}
+		if got := rec.Header().Get("Referrer-Policy"); got != "" {
+			t.Fatalf("Referrer-Policy = %q, want unknown challenge handled without fallback", got)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "" {
+			t.Fatalf("Cache-Control = %q, want unknown challenge handled without fallback", got)
+		}
+	})
+
+	t.Run("RSVP fallback privacy", func(t *testing.T) {
+		const bearer = "RAW-CACHED-COMPOSITION-RSVP-BEARER"
+		const uri = "/rsvp/" + bearer + "/reply/declined?source=email"
+		req := httptest.NewRequest(http.MethodGet, "http://"+host+uri, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMovedPermanently {
+			t.Fatalf("status = %d, want 301", rec.Code)
+		}
+		if got, want := rec.Header().Get("Location"), "https://"+host+uri; got != want {
+			t.Fatalf("Location = %q, want %q", got, want)
+		}
+		if got := rec.Header().Get("Referrer-Policy"); got != "no-referrer" {
+			t.Fatalf("Referrer-Policy = %q, want no-referrer", got)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
+			t.Fatalf("Cache-Control = %q, want private, no-store", got)
+		}
+		if got := rec.Body.String(); got != "" {
+			t.Fatalf("body = %q, want empty RSVP fallback body", got)
+		}
+		for name, values := range rec.Header() {
+			if strings.EqualFold(name, "Location") {
+				continue
+			}
+			if strings.Contains(strings.Join(values, "\n"), bearer) {
+				t.Fatalf("response header %q leaked RSVP capability: %q", name, values)
+			}
+		}
+	})
 }

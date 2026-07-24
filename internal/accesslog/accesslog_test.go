@@ -13,12 +13,23 @@ import (
 func TestRedactPathCapabilityNamespaces(t *testing.T) {
 	t.Parallel()
 	token := strings.Repeat("a", 64)
+	oversizedToken := strings.Repeat("c", 4096)
 	tests := []struct {
 		name string
 		host string
 		path string
 		want string
 	}{
+		{name: "rsvp valid", host: "cal.w33d.xyz", path: "/rsvp/" + token, want: "/rsvp/[capability]"},
+		{name: "rsvp malformed", host: "cal.w33d.xyz", path: "/rsvp/!not-a-token!", want: "/rsvp/[capability]"},
+		{name: "rsvp oversized", host: "cal.w33d.xyz", path: "/rsvp/" + oversizedToken, want: "/rsvp/[capability]"},
+		{name: "rsvp dotted", host: "cal.w33d.xyz", path: "/rsvp/invite.token.json", want: "/rsvp/[capability]"},
+		{name: "rsvp encoded-looking", host: "cal.w33d.xyz", path: "/rsvp/%2e%2e%2fsecret", want: "/rsvp/[capability]"},
+		{name: "rsvp nested", host: "cal.w33d.xyz", path: "/rsvp/" + token + "/reply/accepted", want: "/rsvp/[capability]"},
+		{name: "rsvp wrong host", host: "forum.w33d.xyz", path: "/rsvp/" + token, want: "/rsvp/[capability]"},
+		{name: "rsvp trailing dot host", host: "cal.w33d.xyz.", path: "/rsvp/" + token, want: "/rsvp/[capability]"},
+		{name: "rsvp port host", host: "CAL.W33D.XYZ:443", path: "/rsvp/" + token, want: "/rsvp/[capability]"},
+		{name: "rsvp exact empty", host: "cal.w33d.xyz", path: "/rsvp/", want: "/rsvp/"},
 		{name: "blog review", host: "blog.w33d.xyz", path: "/review/" + token, want: "/review/[capability]"},
 		{name: "blog port", host: "BLOG.W33D.XYZ:443", path: "/review/" + token, want: "/review/[capability]"},
 		{name: "blog malformed suffix", host: "blog.w33d.xyz", path: "/review/" + token + ".", want: "/review/[capability]"},
@@ -67,5 +78,31 @@ func TestWrapNeverEmitsRawCapability(t *testing.T) {
 	}
 	if got := event["path"]; got != "/review/[capability]" {
 		t.Fatalf("logged path = %#v, want redacted capability path", got)
+	}
+}
+
+func TestWrapNeverEmitsRawRSVPCapability(t *testing.T) {
+	const sentinel = "RAW-RSVP-CAPABILITY-SENTINEL"
+	var output bytes.Buffer
+	original := logger
+	SetLogger(slog.New(slog.NewJSONHandler(&output, nil)))
+	t.Cleanup(func() { logger = original })
+
+	handler := Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "https://wrong.w33d.xyz/rsvp/"+sentinel+"/nested", nil)
+	req.Host = "wrong.w33d.xyz"
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if count := strings.Count(output.String(), sentinel); count != 0 {
+		t.Fatalf("access log contains raw RSVP capability sentinel %d time(s): %s", count, output.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal(output.Bytes(), &event); err != nil {
+		t.Fatalf("decode access log: %v", err)
+	}
+	if got := event["path"]; got != "/rsvp/[capability]" {
+		t.Fatalf("logged path = %#v, want %q", got, "/rsvp/[capability]")
 	}
 }

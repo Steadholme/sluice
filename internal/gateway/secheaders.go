@@ -51,12 +51,19 @@ type secHeaderWriter struct {
 // Host and token validity, matching access-log redaction. The two fixed Share Room assets keep
 // their product-provided public cache policy but still receive no-referrer.
 func isCapabilityNamespace(path string) bool {
+	if isRSVPCapabilityPath(path) {
+		return true
+	}
 	for _, prefix := range [...]string{"/review/", "/receipts/", "/s/", "/u/"} {
 		if len(path) >= len(prefix) && path[:len(prefix)] == prefix {
 			return true
 		}
 	}
 	return false
+}
+
+func isRSVPCapabilityPath(path string) bool {
+	return strings.HasPrefix(path, "/rsvp/")
 }
 
 func isCapabilityAuthorityPath(path string) bool {
@@ -108,6 +115,7 @@ func (s *secHeaderWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // Flush passes through so server-sent-event streams (e.g. Klaxon /api/stream) are not buffered.
 func (s *secHeaderWriter) Flush() {
+	s.apply()
 	if f, ok := s.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
