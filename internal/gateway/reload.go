@@ -61,6 +61,10 @@ func (h *ReloadableHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ReloadableHandler) loop(ctx context.Context, interval time.Duration) {
+	if notifier, ok := h.store.(store.RouteChangeNotifier); ok {
+		h.notificationLoop(ctx, notifier.RouteChanges())
+		return
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -68,17 +72,35 @@ func (h *ReloadableHandler) loop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			next := fingerprint(h.store.Routes())
-			if prev := h.fp.Load(); prev != nil && *prev == next {
-				continue // route set unchanged — no rebuild, no proxy churn.
-			}
-			handler := h.build()
-			h.current.Store(&handler)
-			h.fp.Store(&next)
-			if h.log != nil {
-				h.log.Info("gateway routes reloaded", "routes", len(h.store.Routes()))
-			}
+			h.reloadIfChanged()
 		}
+	}
+}
+
+func (h *ReloadableHandler) notificationLoop(ctx context.Context, changes <-chan uint64) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-changes:
+			if !ok {
+				return
+			}
+			h.reloadIfChanged()
+		}
+	}
+}
+
+func (h *ReloadableHandler) reloadIfChanged() {
+	next := fingerprint(h.store.Routes())
+	if prev := h.fp.Load(); prev != nil && *prev == next {
+		return
+	}
+	handler := h.build()
+	h.current.Store(&handler)
+	h.fp.Store(&next)
+	if h.log != nil {
+		h.log.Info("gateway routes reloaded", "routes", len(h.store.Routes()))
 	}
 }
 
@@ -97,6 +119,10 @@ func fingerprint(routes []config.Route) string {
 			r.Auth,
 			strconv.FormatBool(r.Waf),
 			r.RequireGroup,
+			strconv.FormatBool(r.InternalOnly),
+			r.RequirePermission,
+			r.PermissionResource,
+			r.Risk,
 			r.RequireScope,
 		}, "\x1f"))
 	}

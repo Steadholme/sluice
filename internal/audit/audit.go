@@ -44,6 +44,7 @@ const (
 	ActionSSOEstablish     = "sso.session.establish"
 	ActionSSODeny          = "sso.session.deny"
 	ActionSSOLogout        = "sso.logout"
+	ActionSSORevokeSubject = "sso.session.revoke_subject"
 
 	// WAF (Aegis) actions. Block is emitted when a request is rejected (rule score
 	// over threshold, rate limit exceeded, body too large, or upload type denied);

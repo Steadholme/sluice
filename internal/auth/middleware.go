@@ -15,7 +15,10 @@ import (
 // contextKey is a private type for context keys defined in this package.
 type contextKey int
 
-const identityKey contextKey = iota
+const (
+	identityKey contextKey = iota
+	authorizationKey
+)
 
 // Header names injected toward the upstream for verified requests.
 const (

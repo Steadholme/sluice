@@ -67,6 +67,7 @@ go run ./cmd/sluice -config config.json
 | `GW_TOKEN_URL` | **内网** token 端点（开 mTLS 时 `https://keystone:8443/token`，否则 `http://keystone:8080/token`） | 空 |
 | `GW_SESSION_TTL` | 网关浏览器会话有效期（Go duration，如 `8h`） | `8h` |
 | `GW_SESSION_SECRET` | 签名 `__Secure-gw` 不透明 cookie id 的 HMAC 密钥（强随机、稳定） | 空（缺省临时随机，重启失效） |
+| `GW_SESSION_REVOCATION_TOKEN` | 启用 `POST /_gw/internal/v1/sessions/revoke` 的独立 Bearer 凭据；按 exact Keystone subject + `source_version` 写入 `active/frozen/terminated`，非 active 原子吊销并阻止新网关会话；`200` 回显 `subject/state/source_version/replayed` 供 JML consumer 严格确认 | 空（入口不存在，返回 `404`） |
 | `GATEWAY_HMAC_KEY` | 签名上游 `X-Auth-Sig` 身份；PAT 路由还用同一共享密钥生成独立 domain 的 `X-Auth-Scope-Sig` | 空（不注入 identity / PAT scope signature） |
 | `GATEWAY_ZONE_HMAC_KEY` | 仅由 Sluice 与目标 consumer 持有，签名 route+host-bound `X-Gateway-Zone-Sig`；不能复用 identity key | 空（不注入 zone signature） |
 | `GATEWAY_ZONE` | Sluice 为每个上游请求重写的访问平面：`internal` 或 `external` | `external` |
@@ -193,6 +194,15 @@ COLUMN IF NOT EXISTS` 回填，旧行 `auth=''` 仍按 `protected` 派生，`req
 3. 任意 `*.w33d.xyz` 子域名上持有效 `__Secure-gw` 会话的请求 → 注入 `X-Auth-Subject` /
    `X-Auth-Email` / `X-Auth-Scope` 并反代上游。`GET /_gw/auth/logout` 清域 cookie 与会话，
    从任意子域名都生效。
+
+需要 recent strong MFA 的保存后提交走独立 step-up flow。只有配置了 exact-host
+`step_up_resume_path` 的 `auth=sso` 路由才能解析 `/_gw/auth/step-up`；GET 仅显示 no-JS
+确认页，不创建 OAuth state。session／route／host／path／opaque ref／expiry 绑定的 CSRF
+POST 以 `303` 请求 Keystone 的 exact `acr_values=hf-aal-strong`，不接受 browser 提供的
+`return_to`、host 或 action。callback 必须得到相同 subject、`UV=true` 且不超过 300 秒的
+canonical `MFA_STRONG` claims，随后在 Memory/PostgreSQL 中以 binding-aware CAS 原子替换旧
+gateway session，再 `303` 到 route 配置派生的固定 continuation。OAuth error、downgrade、
+stale/future assurance、session race 或 subject mismatch 都保留旧 session，但不会授予强权限。
 
 > 注：cookie 前缀由 `__Host-` 改为 `__Secure-`——`__Host-` 禁止 `Domain` 属性（锁定单主机），
 > `__Secure-` 同样强制 `Secure`+HTTPS 但**允许 `Domain`**，从而把会话作用域到父域 `.w33d.xyz`。
@@ -334,6 +344,7 @@ internal/pat/                 独立 opaque PAT introspection、中间件、exac
 internal/audit/audit.go       非阻塞审计发射器：有界 channel + 后台 worker，即发即忘 POST 到 Watchtower，满/宕机即丢弃
 internal/mtls/mtls.go         内网 mTLS 客户端 transport/Client 构建（Keyward 客户端证书 + root CA + ServerName）
 internal/oidc/oidc.go         OIDC 浏览器 SSO Relying Party：Middleware、/_gw 回调与登出、PKCE、域作用域 __Secure-gw cookie（跨子域）、完整 original_url 返回 + 开放重定向防护、id_token 校验
+internal/oidc/step_up.go      route 派生的 strong-MFA step-up interstitial、session-bound CSRF、固定 continuation 与 fresh assurance gate
 internal/oidc/store.go        gw 会话/状态接口 + 内存实现（测试/静态部署）
 internal/oidc/postgres.go     gw_sessions / gw_oauth_state 的 Postgres 实现（可移植标准 SQL，state 事务内单次消费）
 internal/gateway/router.go    路由匹配（Host 为主键的子域名 vhost + 主机内最长前缀）

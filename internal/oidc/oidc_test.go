@@ -7,6 +7,8 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -35,13 +37,16 @@ type fakeIssuer struct {
 	server *httptest.Server
 	priv   *rsa.PrivateKey
 	url    string
+	// stepUpMode lets negative callback tests model an IdP that returns a token
+	// which does not satisfy the requested strong assurance. Empty is canonical.
+	stepUpMode string
 
 	mu    sync.Mutex
 	codes map[string]codeRec
 }
 
 type codeRec struct {
-	challenge, nonce, redirectURI, clientID, scope string
+	challenge, nonce, redirectURI, clientID, scope, acr string
 }
 
 func newFakeIssuer(t *testing.T) *fakeIssuer {
@@ -82,6 +87,7 @@ func newFakeIssuer(t *testing.T) *fakeIssuer {
 			redirectURI: q.Get("redirect_uri"),
 			clientID:    q.Get("client_id"),
 			scope:       q.Get("scope"),
+			acr:         q.Get("acr_values"),
 		}
 		fi.mu.Unlock()
 		loc := q.Get("redirect_uri") + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(q.Get("state"))
@@ -110,6 +116,19 @@ func newFakeIssuer(t *testing.T) *fakeIssuer {
 			return
 		}
 		idToken := fi.signID(t, rec.nonce, time.Now().Add(time.Hour))
+		if rec.acr == stepUpRequiredACR {
+			switch fi.stepUpMode {
+			case "weak":
+			case "stale":
+				idToken = fi.signStrongID(t, rec.nonce, testSub, time.Now().Unix()-301, time.Now().Add(time.Hour))
+			case "future":
+				idToken = fi.signStrongID(t, rec.nonce, testSub, time.Now().Unix()+60, time.Now().Add(time.Hour))
+			case "wrong-sub":
+				idToken = fi.signStrongID(t, rec.nonce, "u_other", time.Now().Unix(), time.Now().Add(time.Hour))
+			default:
+				idToken = fi.signStrongID(t, rec.nonce, testSub, time.Now().Unix(), time.Now().Add(time.Hour))
+			}
+		}
 		writeJSON(w, map[string]any{
 			"access_token": "at-" + code,
 			"id_token":     idToken,
@@ -144,6 +163,41 @@ func (fi *fakeIssuer) signID(t *testing.T, nonce string, exp time.Time) string {
 	signed, err := tok.SignedString(fi.priv)
 	if err != nil {
 		t.Fatalf("sign id_token: %v", err)
+	}
+	return signed
+}
+
+func (fi *fakeIssuer) signStrongID(
+	t *testing.T,
+	nonce string,
+	subject string,
+	authTime int64,
+	exp time.Time,
+) string {
+	t.Helper()
+	claims := jwt.MapClaims{
+		"iss":       fi.url,
+		"sub":       subject,
+		"aud":       testClientID,
+		"exp":       exp.Unix(),
+		"iat":       time.Now().Add(-time.Minute).Unix(),
+		"email":     testEmail,
+		"nonce":     nonce,
+		"auth_time": authTime,
+		"acr":       stepUpRequiredACR,
+		"amr":       []string{"pwd", "otp"},
+		"hf_mfa": map[string]any{
+			"aal": SessionMFAStrong,
+			"uv":  true,
+			"sb":  strings.Repeat("a", 64),
+			"fe":  7,
+		},
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tok.Header["kid"] = testKID
+	signed, err := tok.SignedString(fi.priv)
+	if err != nil {
+		t.Fatalf("sign strong id_token: %v", err)
 	}
 	return signed
 }
@@ -309,6 +363,9 @@ func TestBeginAuthRedirectParams(t *testing.T) {
 			t.Errorf("authorize missing %s", k)
 		}
 	}
+	if got := q.Get("acr_values"); got != "" {
+		t.Errorf("ordinary login unexpectedly requested acr_values=%q", got)
+	}
 }
 
 // TestCallbackUnknownStateRejected proves an unknown/forged state is rejected
@@ -327,6 +384,31 @@ func TestCallbackUnknownStateRejected(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for unknown state", resp.StatusCode)
+	}
+}
+
+func TestCallbackRejectsAmbiguousStateWithoutConsumingEitherValue(t *testing.T) {
+	fi := newFakeIssuer(t)
+	p := newTestProvider(t, fi)
+	stored := OAuthState{
+		State: "legitimate-state", Nonce: "nonce", CodeVerifier: "verifier",
+		ExpiresAt: time.Now().Add(time.Minute).Unix(), Flow: OAuthFlowLogin,
+	}
+	if err := p.states.PutState(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"https://id.example"+CallbackPath+"?state=legitimate-state&state=attacker&code=unused",
+		nil,
+	)
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("ambiguous state status = %d, want 400", recorder.Code)
+	}
+	if _, ok, err := p.states.TakeState(context.Background(), stored.State); err != nil || !ok {
+		t.Fatalf("ambiguous callback consumed legitimate state: ok=%t err=%v", ok, err)
 	}
 }
 
@@ -493,6 +575,9 @@ func TestSafeReturnCrossSubdomain(t *testing.T) {
 		{"http://vitals.w33d.xyz/x", "/x"},
 		{"https://notw33d.xyz/x", "/x"},
 		{"//evil.com/x", "/x"},
+		{`/\\evil.com/x`, "/"},
+		{"/safe\nunsafe", "/"},
+		{"https://user@vitals.w33d.xyz/x", "/"},
 		{"", "/"},
 	}
 	for _, tc := range cases {
@@ -693,6 +778,105 @@ func TestMemoryStateSingleUse(t *testing.T) {
 	}
 	if _, ok, _ := m.TakeState(ctx, "s1"); ok {
 		t.Error("second TakeState should fail (single-use)")
+	}
+}
+
+func TestSubjectWideSessionRevocationEndpoint(t *testing.T) {
+	store := NewMemoryStore()
+	now := time.Now().Unix()
+	for _, session := range []Session{
+		{ID: "target-1", Sub: testSub, CreatedAt: now, ExpiresAt: now + 3600},
+		{ID: "target-2", Sub: testSub, CreatedAt: now, ExpiresAt: now + 3600},
+		{ID: "other", Sub: "u_other", CreatedAt: now, ExpiresAt: now + 3600},
+	} {
+		if err := store.CreateSession(context.Background(), session); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+	}
+
+	p := &Provider{
+		cfg:      Config{SessionRevocationToken: "dedicated-jml-token"},
+		sessions: store,
+		log:      slog.Default(),
+	}
+
+	request := func(method, authorization, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, SessionRevocationPath, strings.NewReader(body))
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
+		}
+		recorder := httptest.NewRecorder()
+		p.ServeHTTP(recorder, req)
+		return recorder
+	}
+
+	if got := request(http.MethodGet, "Bearer dedicated-jml-token", ""); got.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d, want 405", got.Code)
+	}
+	if got := request(http.MethodPost, "Bearer wrong", `{"subject":"u_admin"}`); got.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token status = %d, want 401", got.Code)
+	}
+	if got := request(http.MethodPost, "Bearer dedicated-jml-token", `{"subject":" u_admin","state":"terminated","source_event_id":"event-42","source_version":42}`); got.Code != http.StatusBadRequest {
+		t.Fatalf("non-canonical subject status = %d, want 400", got.Code)
+	}
+	if _, ok, _ := store.GetSession(context.Background(), "target-1"); !ok {
+		t.Fatal("rejected request revoked a session")
+	}
+
+	const terminated = `{"subject":"u_admin","state":"terminated","source_event_id":"event-42","source_version":42,"correlation_id":"jml-42"}`
+	got := request(http.MethodPost, "Bearer dedicated-jml-token", terminated)
+	if got.Code != http.StatusOK {
+		t.Fatalf("valid revoke status = %d body=%s", got.Code, got.Body.String())
+	}
+	if got.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got.Header().Get("Cache-Control"))
+	}
+	var response struct {
+		Subject         string              `json:"subject"`
+		State           SubjectSessionState `json:"state"`
+		SourceVersion   int64               `json:"source_version"`
+		Revoked         int64               `json:"revoked"`
+		RevokedSessions int64               `json:"revoked_sessions"`
+	}
+	if err := json.Unmarshal(got.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Subject != testSub || response.State != SubjectSessionTerminated || response.SourceVersion != 42 {
+		t.Fatalf("acknowledgement = %+v, want subject/state/version echo", response)
+	}
+	if response.Revoked != 2 || response.RevokedSessions != 2 {
+		t.Fatalf("revoked = %d/%d, want 2/2", response.Revoked, response.RevokedSessions)
+	}
+	for _, id := range []string{"target-1", "target-2"} {
+		if _, ok, _ := store.GetSession(context.Background(), id); ok {
+			t.Fatalf("session %q survived subject revocation", id)
+		}
+	}
+	if _, ok, _ := store.GetSession(context.Background(), "other"); !ok {
+		t.Fatal("different subject session was revoked")
+	}
+	if err := store.CreateSession(context.Background(), Session{ID: "late", Sub: testSub, ExpiresAt: now + 3600}); !errors.Is(err, ErrSubjectSessionBlocked) {
+		t.Fatalf("late session creation error = %v, want blocked", err)
+	}
+
+	// Replays are epoch/version-stable; conflicting or stale updates fail closed.
+	if replay := request(http.MethodPost, "Bearer dedicated-jml-token", terminated); replay.Code != http.StatusOK || !strings.Contains(replay.Body.String(), `"replayed":true`) {
+		t.Fatalf("replay = status %d body %q", replay.Code, replay.Body.String())
+	}
+	if conflict := request(http.MethodPost, "Bearer dedicated-jml-token", `{"subject":"u_admin","state":"active","source_event_id":"conflict","source_version":42}`); conflict.Code != http.StatusConflict {
+		t.Fatalf("conflict status = %d, want 409", conflict.Code)
+	}
+	if active := request(http.MethodPost, "Bearer dedicated-jml-token", `{"subject":"u_admin","state":"active","source_event_id":"event-43","source_version":43}`); active.Code != http.StatusOK {
+		t.Fatalf("active status = %d body=%q", active.Code, active.Body.String())
+	}
+	if err := store.CreateSession(context.Background(), Session{ID: "rehire", Sub: testSub, ExpiresAt: now + 3600}); err != nil {
+		t.Fatalf("active subject could not create session: %v", err)
+	}
+
+	p.cfg.SessionRevocationToken = ""
+	if disabled := request(http.MethodPost, "Bearer dedicated-jml-token", `{"subject":"u_other"}`); disabled.Code != http.StatusNotFound {
+		t.Fatalf("disabled endpoint status = %d, want 404", disabled.Code)
 	}
 }
 

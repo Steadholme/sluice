@@ -18,6 +18,52 @@ func minimalValid() *Config {
 	}
 }
 
+func validTrustedMFAConfig() *Config {
+	c := minimalValid()
+	c.TrustedMFAEnabled = true
+	c.KeystoneAssuranceURL = "https://keystone:8443/internal/v1/session-assurance"
+	c.KeystoneAssuranceServiceToken = strings.Repeat("l", 32)
+	c.MFAAssertionHMACKey = strings.Repeat("c", 32)
+	c.GWClientSecret = strings.Repeat("o", 32)
+	c.GWSessionSecret = strings.Repeat("s", 32)
+	c.GWSessionRevocationToken = strings.Repeat("r", 32)
+	c.AuditIngestToken = strings.Repeat("a", 32)
+	c.VerdictDecisionToken = strings.Repeat("v", 32)
+	c.GatewayHMACKey = strings.Repeat("i", 32)
+	c.GatewayZoneHMACKey = strings.Repeat("z", 32)
+	c.GatewayAuthzHMACKey = strings.Repeat("g", 32)
+	return c
+}
+
+func TestPermissionRouteDefaultsAndValidation(t *testing.T) {
+	c := minimalValid()
+	c.Routes[0].Auth = AuthSSO
+	c.Routes[0].RequirePermission = "cpa.console.enter"
+	c.Routes[0].InternalOnly = true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate(permission route): %v", err)
+	}
+	route := c.Routes[0]
+	if route.PermissionResource != "route:ok" || route.Risk != RiskLow || !route.InternalOnly {
+		t.Fatalf("normalized permission route = %+v", route)
+	}
+
+	for _, mutate := range []func(*Route){
+		func(route *Route) { route.Auth = AuthSSOOptional },
+		func(route *Route) { route.RequirePermission = "cpa.enter" },
+		func(route *Route) { route.PermissionResource = "Route:ok" },
+		func(route *Route) { route.Risk = "severe" },
+	} {
+		invalid := minimalValid()
+		invalid.Routes[0].Auth = AuthSSO
+		invalid.Routes[0].RequirePermission = "cpa.console.enter"
+		mutate(&invalid.Routes[0])
+		if err := invalid.Validate(); err == nil {
+			t.Fatalf("invalid permission route accepted: %+v", invalid.Routes[0])
+		}
+	}
+}
+
 func TestValidateTLSModeOffDefaults(t *testing.T) {
 	c := minimalValid()
 	if err := c.Validate(); err != nil {
@@ -272,6 +318,50 @@ func TestPATRouteRequiresExactlyOneScope(t *testing.T) {
 	}
 }
 
+func TestStepUpResumePathRequiresExactHostSSORoute(t *testing.T) {
+	validRoute := Route{
+		Name:             "access-root",
+		Match:            Match{Host: "access.w33d.xyz", PathPrefix: "/"},
+		Upstream:         "http://access-governance:9390",
+		Auth:             AuthSSO,
+		StepUpResumePath: "/request/scope/step-up/",
+	}
+	for _, test := range []struct {
+		name  string
+		alter func(*Route)
+		want  string
+	}{
+		{name: "valid", alter: func(*Route) {}},
+		{name: "host agnostic", alter: func(route *Route) { route.Match.Host = "" }, want: "exact-host"},
+		{name: "host authority", alter: func(route *Route) { route.Match.Host = "access.w33d.xyz@evil.example" }, want: "exact-host"},
+		{name: "host port", alter: func(route *Route) { route.Match.Host = "access.w33d.xyz:443" }, want: "exact-host"},
+		{name: "public auth", alter: func(route *Route) { route.Auth = AuthPublic }, want: "auth=sso"},
+		{name: "missing trailing slash", alter: func(route *Route) { route.StepUpResumePath = "/request/scope/step-up" }, want: "ending in /"},
+		{name: "protocol relative", alter: func(route *Route) { route.StepUpResumePath = "//evil.example/" }, want: "safe absolute"},
+		{name: "backslash", alter: func(route *Route) { route.StepUpResumePath = `/request/\\evil/` }, want: "safe absolute"},
+		{name: "encoded backslash", alter: func(route *Route) { route.StepUpResumePath = `/request/%5cevil/` }, want: "scheme, authority"},
+		{name: "query", alter: func(route *Route) { route.StepUpResumePath = "/request/?next=/" }, want: "safe absolute"},
+		{name: "fragment", alter: func(route *Route) { route.StepUpResumePath = "/request/#next/" }, want: "safe absolute"},
+		{name: "control", alter: func(route *Route) { route.StepUpResumePath = "/request/\n/" }, want: "safe absolute"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			route := validRoute
+			test.alter(&route)
+			config := &Config{KeystoneIssuer: "http://127.0.0.1:8080", Routes: []Route{route}}
+			err := config.Validate()
+			if test.want == "" {
+				if err != nil {
+					t.Fatalf("valid route rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestApplyEnvPATIntrospectionURL(t *testing.T) {
 	t.Setenv(EnvPATIntrospectionURL, "  https://keystone:8443/internal/v1/pats/introspect  ")
 	c := minimalValid()
@@ -292,6 +382,7 @@ func TestApplyEnvGatewayOIDCAndMTLS(t *testing.T) {
 	t.Setenv(EnvGWTokenURL, "https://keystone:8443/token")
 	t.Setenv(EnvGWSessionTTL, "2h")
 	t.Setenv(EnvGWSessionSecret, "cookie-key")
+	t.Setenv(EnvGWSessionRevocationToken, "dedicated-session-revocation-token")
 	t.Setenv(EnvInternalMTLS, "on")
 	t.Setenv(EnvKeystoneMTLSCert, "/certs/sluice.crt")
 	t.Setenv(EnvKeystoneMTLSKey, "/certs/sluice.key")
@@ -318,8 +409,257 @@ func TestApplyEnvGatewayOIDCAndMTLS(t *testing.T) {
 	if c.GWSessionTTL != 2*time.Hour {
 		t.Errorf("GWSessionTTL = %v, want 2h", c.GWSessionTTL)
 	}
+	if c.GWSessionRevocationToken != "dedicated-session-revocation-token" {
+		t.Errorf("GWSessionRevocationToken = %q, want env value", c.GWSessionRevocationToken)
+	}
 	if !c.InternalMTLS || c.KeystoneMTLSCert != "/certs/sluice.crt" || c.KeystoneTLSServerName != "keystone" {
 		t.Errorf("mtls knobs not applied: %+v", c)
+	}
+}
+
+func TestApplyEnvTrustedMFA(t *testing.T) {
+	t.Setenv(EnvTrustedMFAEnabled, "on")
+	t.Setenv(EnvKeystoneAssuranceURL, "https://keystone:8443/internal/v1/session-assurance")
+	t.Setenv(EnvKeystoneAssuranceServiceToken, strings.Repeat("l", 32))
+	t.Setenv(EnvMFAAssertionHMACKey, strings.Repeat("c", 32))
+
+	c := minimalValid()
+	c.ApplyEnv()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !c.TrustedMFAEnabled {
+		t.Fatal("TrustedMFAEnabled = false, want true")
+	}
+	if c.KeystoneAssuranceURL != "https://keystone:8443/internal/v1/session-assurance" {
+		t.Fatalf("KeystoneAssuranceURL = %q", c.KeystoneAssuranceURL)
+	}
+	if c.KeystoneAssuranceServiceToken != strings.Repeat("l", 32) {
+		t.Fatal("KeystoneAssuranceServiceToken did not use the environment overlay")
+	}
+	if c.MFAAssertionHMACKey != strings.Repeat("c", 32) {
+		t.Fatal("MFAAssertionHMACKey did not use the environment overlay")
+	}
+}
+
+func TestTrustedMFADisabledPreservesLegacyConfiguration(t *testing.T) {
+	t.Setenv(EnvTrustedMFAEnabled, "off")
+	t.Setenv(EnvKeystoneAssuranceURL, "not-an-absolute-url")
+	t.Setenv(EnvKeystoneAssuranceServiceToken, "short")
+	t.Setenv(EnvMFAAssertionHMACKey, "short")
+
+	c := minimalValid()
+	c.ApplyEnv()
+	if c.TrustedMFAEnabled {
+		t.Fatal("TrustedMFAEnabled = true, want disabled backward-compatible behavior")
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("disabled Trusted MFA rejected legacy configuration: %v", err)
+	}
+}
+
+func TestApplyEnvTrustedMFARejectsInvalidToggle(t *testing.T) {
+	t.Setenv(EnvTrustedMFAEnabled, "onn")
+
+	c := minimalValid()
+	c.ApplyEnv()
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "TRUSTED_MFA must be exactly on or off") {
+		t.Fatalf("Validate error = %v, want strict TRUSTED_MFA toggle rejection", err)
+	}
+}
+
+func TestValidateTrustedMFARequiresStrictAssuranceURL(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		url  string
+	}{
+		{name: "missing", url: ""},
+		{name: "relative", url: "/internal/v1/session-assurance"},
+		{name: "missing host", url: "https:///internal/v1/session-assurance"},
+		{name: "unsupported scheme", url: "ftp://keystone/internal/v1/session-assurance"},
+		{name: "userinfo", url: "https://service:secret@keystone/internal/v1/session-assurance"},
+		{name: "query", url: "https://keystone/internal/v1/session-assurance?subject=user"},
+		{name: "fragment", url: "https://keystone/internal/v1/session-assurance#fragment"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := validTrustedMFAConfig()
+			c.KeystoneAssuranceURL = test.url
+			if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "keystone_assurance_url") {
+				t.Fatalf("Validate error = %v, want strict assurance URL rejection", err)
+			}
+		})
+	}
+
+	for _, endpoint := range []string{
+		"http://keystone:8080/internal/v1/session-assurance",
+		"https://keystone:8443/internal/v1/session-assurance",
+	} {
+		t.Run("accept "+endpoint[:strings.Index(endpoint, ":")], func(t *testing.T) {
+			c := validTrustedMFAConfig()
+			c.KeystoneAssuranceURL = endpoint
+			if err := c.Validate(); err != nil {
+				t.Fatalf("valid assurance URL %q rejected: %v", endpoint, err)
+			}
+		})
+	}
+
+	c := validTrustedMFAConfig()
+	c.InternalMTLS = true
+	c.KeystoneAssuranceURL = "http://keystone:8080/internal/v1/session-assurance"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "internal_mtls requires an https") {
+		t.Fatalf("Validate error = %v, want mTLS downgrade rejection", err)
+	}
+}
+
+func TestValidateTrustedMFASecretBoundsAndVisibleASCII(t *testing.T) {
+	type secretSetter struct {
+		name string
+		set  func(*Config, string)
+	}
+	secrets := []secretSetter{
+		{
+			name: "keystone_assurance_service_token",
+			set: func(c *Config, value string) {
+				c.KeystoneAssuranceServiceToken = value
+			},
+		},
+		{
+			name: "mfa_assertion_hmac_key",
+			set: func(c *Config, value string) {
+				c.MFAAssertionHMACKey = value
+			},
+		},
+	}
+	for _, required := range secrets {
+		t.Run(required.name+"/required", func(t *testing.T) {
+			c := validTrustedMFAConfig()
+			required.set(c, "")
+			if err := c.Validate(); err == nil || !strings.Contains(err.Error(), required.name) {
+				t.Fatalf("Validate error = %v, want missing required secret rejection", err)
+			}
+		})
+	}
+
+	invalidValues := []struct {
+		name string
+		make func(byte) string
+		want string
+	}{
+		{name: "31 bytes", make: func(fill byte) string { return strings.Repeat(string(fill), 31) }, want: "between 32 and 512"},
+		{name: "513 bytes", make: func(fill byte) string { return strings.Repeat(string(fill), 513) }, want: "between 32 and 512"},
+		{name: "space", make: func(fill byte) string { return strings.Repeat(string(fill), 31) + " " }, want: "visible ASCII"},
+		{name: "delete", make: func(fill byte) string { return strings.Repeat(string(fill), 31) + "\x7f" }, want: "visible ASCII"},
+		{name: "non ASCII", make: func(fill byte) string { return strings.Repeat(string(fill), 30) + "é" }, want: "visible ASCII"},
+	}
+	for i, secret := range secrets {
+		fill := byte('X' + i)
+		for _, invalid := range invalidValues {
+			t.Run(secret.name+"/reject "+invalid.name, func(t *testing.T) {
+				c := validTrustedMFAConfig()
+				secret.set(c, invalid.make(fill))
+				if err := c.Validate(); err == nil || !strings.Contains(err.Error(), invalid.want) {
+					t.Fatalf("Validate error = %v, want %q", err, invalid.want)
+				}
+			})
+		}
+		for _, valid := range []struct {
+			name  string
+			value string
+		}{
+			{name: "32 visible ASCII bytes", value: strings.Repeat(string(fill), 32)},
+			{name: "512 visible ASCII bytes", value: strings.Repeat(string(fill), 512)},
+			{name: "visible ASCII endpoints", value: strings.Repeat("!~", 16)},
+		} {
+			t.Run(secret.name+"/accept "+valid.name, func(t *testing.T) {
+				c := validTrustedMFAConfig()
+				secret.set(c, valid.value)
+				if err := c.Validate(); err != nil {
+					t.Fatalf("valid %s rejected: %v", secret.name, err)
+				}
+			})
+		}
+	}
+
+}
+
+func TestValidateTrustedMFACredentialsArePairwiseDistinct(t *testing.T) {
+	type credentialSetter struct {
+		name string
+		set  func(*Config, string)
+	}
+	credentials := []credentialSetter{
+		{name: "OIDC client secret", set: func(c *Config, value string) { c.GWClientSecret = value }},
+		{name: "gateway session secret", set: func(c *Config, value string) { c.GWSessionSecret = value }},
+		{name: "session revocation token", set: func(c *Config, value string) { c.GWSessionRevocationToken = value }},
+		{name: "Keystone assurance lookup token", set: func(c *Config, value string) { c.KeystoneAssuranceServiceToken = value }},
+		{name: "MFA assertion current key", set: func(c *Config, value string) { c.MFAAssertionHMACKey = value }},
+		{name: "audit ingest token", set: func(c *Config, value string) { c.AuditIngestToken = value }},
+		{name: "Verdict decision token", set: func(c *Config, value string) { c.VerdictDecisionToken = value }},
+		{name: "gateway identity key", set: func(c *Config, value string) { c.GatewayHMACKey = value }},
+		{name: "gateway zone key", set: func(c *Config, value string) { c.GatewayZoneHMACKey = value }},
+		{name: "gateway authorization key", set: func(c *Config, value string) { c.GatewayAuthzHMACKey = value }},
+	}
+	shared := strings.Repeat("x", 32)
+	for i := 0; i < len(credentials); i++ {
+		for j := i + 1; j < len(credentials); j++ {
+			left := credentials[i]
+			right := credentials[j]
+			t.Run(left.name+"/"+right.name, func(t *testing.T) {
+				c := validTrustedMFAConfig()
+				left.set(c, shared)
+				right.set(c, shared)
+				if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "must be distinct") {
+					t.Fatalf("Validate error = %v, want duplicate credential rejection", err)
+				}
+			})
+		}
+	}
+
+	if err := validTrustedMFAConfig().Validate(); err != nil {
+		t.Fatalf("pairwise-distinct Trusted MFA credentials rejected: %v", err)
+	}
+}
+
+func TestSessionRevocationTokenMustBeStrongAndDistinct(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		apply func(*Config)
+	}{
+		{
+			name: "too short",
+			apply: func(config *Config) {
+				config.GWSessionRevocationToken = "short"
+			},
+		},
+		{
+			name: "reuses session secret",
+			apply: func(config *Config) {
+				config.GWSessionSecret = "shared-credential-that-is-at-least-32-bytes"
+				config.GWSessionRevocationToken = config.GWSessionSecret
+			},
+		},
+		{
+			name: "reuses authorization key",
+			apply: func(config *Config) {
+				config.GatewayAuthzHMACKey = "shared-credential-that-is-at-least-32-bytes"
+				config.GWSessionRevocationToken = config.GatewayAuthzHMACKey
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := minimalValid()
+			test.apply(config)
+			if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "gw_session_revocation_token") {
+				t.Fatalf("Validate error = %v, want revocation-token rejection", err)
+			}
+		})
+	}
+
+	valid := minimalValid()
+	valid.GWSessionSecret = "session-secret-that-is-at-least-32-bytes"
+	valid.GWSessionRevocationToken = "independent-revocation-token-at-least-32-bytes"
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("independent token rejected: %v", err)
 	}
 }
 
@@ -378,6 +718,105 @@ func TestApplyEnvAuditOverrides(t *testing.T) {
 	}
 }
 
+func TestApplyEnvVerdictDecisionToken(t *testing.T) {
+	t.Setenv(EnvRBACEnabled, "on")
+	t.Setenv(EnvVerdictURL, "http://verdict:9140")
+	t.Setenv(EnvVerdictDecisionToken, strings.Repeat("d", 32))
+	// The retired broad token must not be accepted as a compatibility fallback.
+	t.Setenv("VERDICT_SERVICE_TOKEN", strings.Repeat("l", 32))
+
+	c := minimalValid()
+	c.ApplyEnv()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if c.VerdictDecisionToken != strings.Repeat("d", 32) {
+		t.Fatalf("VerdictDecisionToken = %q, want scoped env value", c.VerdictDecisionToken)
+	}
+}
+
+func TestValidateRBACRequiresScopedDecisionCredential(t *testing.T) {
+	validToken := strings.Repeat("d", 32)
+	for _, test := range []struct {
+		name  string
+		apply func(*Config)
+		want  string
+	}{
+		{
+			name: "missing url",
+			apply: func(config *Config) {
+				config.VerdictDecisionToken = validToken
+			},
+			want: "verdict_url",
+		},
+		{
+			name: "relative url",
+			apply: func(config *Config) {
+				config.VerdictURL = "verdict:9140"
+				config.VerdictDecisionToken = validToken
+			},
+			want: "absolute verdict_url",
+		},
+		{
+			name: "missing token",
+			apply: func(config *Config) {
+				config.VerdictURL = "http://verdict:9140"
+			},
+			want: "verdict_decision_token",
+		},
+		{
+			name: "short token",
+			apply: func(config *Config) {
+				config.VerdictURL = "http://verdict:9140"
+				config.VerdictDecisionToken = "short"
+			},
+			want: "between 32 and 512",
+		},
+		{
+			name: "oversized token",
+			apply: func(config *Config) {
+				config.VerdictURL = "http://verdict:9140"
+				config.VerdictDecisionToken = strings.Repeat("d", 513)
+			},
+			want: "between 32 and 512",
+		},
+		{
+			name: "non-visible token",
+			apply: func(config *Config) {
+				config.VerdictURL = "http://verdict:9140"
+				config.VerdictDecisionToken = strings.Repeat("d", 31) + "\n"
+			},
+			want: "visible ASCII",
+		},
+		{
+			name: "reused gateway credential",
+			apply: func(config *Config) {
+				config.VerdictURL = "http://verdict:9140"
+				config.VerdictDecisionToken = validToken
+				config.GatewayHMACKey = validToken
+			},
+			want: "must be distinct",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := minimalValid()
+			config.RBACEnabled = true
+			test.apply(config)
+			if err := config.Validate(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate error = %v, want %q", err, test.want)
+			}
+		})
+	}
+
+	valid := minimalValid()
+	valid.RBACEnabled = true
+	valid.VerdictURL = "http://verdict:9140"
+	valid.VerdictDecisionToken = validToken
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid scoped decision credential rejected: %v", err)
+	}
+}
+
 func TestGatewayDefaults(t *testing.T) {
 	t.Setenv(EnvGatewayZone, "")
 
@@ -427,6 +866,117 @@ func TestValidateRejectsReusedGatewayContextKey(t *testing.T) {
 	err := c.Validate()
 	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
 		t.Fatalf("Validate error = %v, want distinct gateway HMAC keys error", err)
+	}
+}
+
+func TestValidateRejectsReusedAuthorizationContextKey(t *testing.T) {
+	for _, configure := range []func(*Config){
+		func(config *Config) {
+			config.GatewayHMACKey = "shared-key"
+			config.GatewayAuthzHMACKey = "shared-key"
+		},
+		func(config *Config) {
+			config.GatewayZoneHMACKey = "shared-key"
+			config.GatewayAuthzHMACKey = "shared-key"
+		},
+	} {
+		config := minimalValid()
+		configure(config)
+		if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "must be distinct") {
+			t.Fatalf("Validate error = %v, want distinct authorization HMAC key", err)
+		}
+	}
+}
+
+func TestApplyEnvAuthorizationContextV2Rotation(t *testing.T) {
+	t.Setenv(EnvGatewayAuthzContextV2HMACKIDCurrent, "authz2-2026a")
+	t.Setenv(EnvGatewayAuthzContextV2HMACKeyCurrent, strings.Repeat("c", 32))
+	t.Setenv(EnvGatewayAuthzContextV2HMACKIDPrevious, "authz2-2025h")
+	t.Setenv(EnvGatewayAuthzContextV2HMACKeyPrevious, strings.Repeat("p", 32))
+
+	c := minimalValid()
+	c.ApplyEnv()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !c.AuthorizationContextV2Enabled() ||
+		c.GatewayAuthzContextV2HMACKIDCurrent != "authz2-2026a" ||
+		c.GatewayAuthzContextV2HMACKIDPrevious != "authz2-2025h" {
+		t.Fatalf("v2 rotation env was not loaded atomically: %+v", c)
+	}
+}
+
+func TestValidateAuthorizationContextV2RejectsTornDuplicateAndReusedBindings(t *testing.T) {
+	valid := func() *Config {
+		c := minimalValid()
+		c.GatewayAuthzContextV2HMACKIDCurrent = "authz2-2026a"
+		c.GatewayAuthzContextV2HMACKeyCurrent = strings.Repeat("c", 32)
+		c.GatewayAuthzContextV2HMACKIDPrevious = "authz2-2025h"
+		c.GatewayAuthzContextV2HMACKeyPrevious = strings.Repeat("p", 32)
+		return c
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "missing current kid", mutate: func(c *Config) { c.GatewayAuthzContextV2HMACKIDCurrent = "" }},
+		{name: "missing current key", mutate: func(c *Config) { c.GatewayAuthzContextV2HMACKeyCurrent = "" }},
+		{name: "missing previous kid", mutate: func(c *Config) { c.GatewayAuthzContextV2HMACKIDPrevious = "" }},
+		{name: "missing previous key", mutate: func(c *Config) { c.GatewayAuthzContextV2HMACKeyPrevious = "" }},
+		{name: "duplicate kid", mutate: func(c *Config) { c.GatewayAuthzContextV2HMACKIDPrevious = c.GatewayAuthzContextV2HMACKIDCurrent }},
+		{name: "duplicate key", mutate: func(c *Config) { c.GatewayAuthzContextV2HMACKeyPrevious = c.GatewayAuthzContextV2HMACKeyCurrent }},
+		{name: "invalid kid", mutate: func(c *Config) { c.GatewayAuthzContextV2HMACKIDCurrent = "Authz2 Current" }},
+		{name: "short key", mutate: func(c *Config) { c.GatewayAuthzContextV2HMACKeyCurrent = "short" }},
+		{name: "legacy key reuse", mutate: func(c *Config) { c.GatewayAuthzHMACKey = c.GatewayAuthzContextV2HMACKeyCurrent }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := valid()
+			test.mutate(c)
+			if err := c.Validate(); err == nil {
+				t.Fatalf("invalid v2 rotation accepted: %+v", c)
+			}
+		})
+	}
+
+	currentOnly := valid()
+	currentOnly.GatewayAuthzContextV2HMACKIDPrevious = ""
+	currentOnly.GatewayAuthzContextV2HMACKeyPrevious = ""
+	if err := currentOnly.Validate(); err != nil {
+		t.Fatalf("current-only rotation rejected: %v", err)
+	}
+}
+
+func TestAuthorizationContextV2PermissionRouteRequiresExactHost(t *testing.T) {
+	build := func(host string) *Config {
+		c := minimalValid()
+		c.Routes[0].Auth = AuthSSO
+		c.Routes[0].Match.Host = host
+		c.Routes[0].RequirePermission = "cpa.console.enter"
+		c.GatewayAuthzContextV2HMACKIDCurrent = "authz2-2026a"
+		c.GatewayAuthzContextV2HMACKeyCurrent = strings.Repeat("c", 32)
+		return c
+	}
+	if err := build("").Validate(); err == nil || !strings.Contains(err.Error(), "exact lowercase host") {
+		t.Fatalf("hostless v2 permission route error = %v", err)
+	}
+	if err := build("cpa.w33d.xyz").Validate(); err != nil {
+		t.Fatalf("exact-host v2 permission route rejected: %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "noncanonical route", mutate: func(c *Config) { c.Routes[0].Name = "CPA Root" }},
+		{name: "noncanonical resource", mutate: func(c *Config) { c.Routes[0].PermissionResource = "route:folders/1" }},
+		{name: "any resource", mutate: func(c *Config) { c.Routes[0].PermissionResource = "any:everything" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := build("cpa.w33d.xyz")
+			test.mutate(c)
+			if err := c.Validate(); err == nil {
+				t.Fatalf("noncanonical v2 route accepted: %+v", c.Routes[0])
+			}
+		})
 	}
 }
 

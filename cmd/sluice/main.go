@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -96,6 +97,7 @@ func main() {
 	// bearer/public paths from starting.
 	provider, closeProvider := buildProvider(cfg, jwks, internalClient, auditor, log)
 	defer closeProvider()
+	assuranceLookup := buildAssuranceLookup(cfg, internalClient, log)
 
 	// Inline WAF + rate limiter (Aegis), env-toggled by WAF_ENABLED. Off by default:
 	// a disabled engine is a pass-through and only routes flagged waf=true are
@@ -117,14 +119,13 @@ func main() {
 	})
 	defer wafEngine.Close()
 
-	// Verdict-backed RBAC authorizer (env-toggled by RBAC_ENABLED). Off/unconfigured
-	// is a no-op: a route's require_group is ignored and every sso route stays plain
-	// SSO. When on, group-gated sso routes consult Verdict over the internal network
-	// (VERDICT_URL) with the service token; a cold-cache Verdict outage fails closed.
+	// Verdict-backed RBAC authorizer (env-toggled by RBAC_ENABLED). Off is a no-op.
+	// When on, startup requires a valid VERDICT_URL plus the decision-only token;
+	// group and permission checks fail closed on a cold-cache Verdict outage.
 	authz := rbac.New(rbac.Config{
 		Enabled:    cfg.RBACEnabled,
 		VerdictURL: cfg.VerdictURL,
-		Token:      cfg.VerdictServiceToken,
+		Token:      cfg.VerdictDecisionToken,
 		Log:        log,
 	})
 
@@ -144,8 +145,23 @@ func main() {
 		PublicOnlyAllowHosts: hostSet(cfg.PublicOnlyAllow),
 		GatewayHMACKey:       cfg.GatewayHMACKey,
 		GatewayZoneHMACKey:   cfg.GatewayZoneHMACKey,
-		GatewayZone:          cfg.GatewayZone,
-		SessionCookieName:    oidc.DefaultCookieName,
+		GatewayAuthzHMACKey:  cfg.GatewayAuthzHMACKey,
+		GatewayAuthzContextV2Keys: auth.AuthorizationContextV2Keyring{
+			Current: auth.AuthorizationContextV2Key{
+				KID: cfg.GatewayAuthzContextV2HMACKIDCurrent,
+				Key: cfg.GatewayAuthzContextV2HMACKeyCurrent,
+			},
+			Previous: auth.AuthorizationContextV2Key{
+				KID: cfg.GatewayAuthzContextV2HMACKIDPrevious,
+				Key: cfg.GatewayAuthzContextV2HMACKeyPrevious,
+			},
+		},
+		TrustedMFAEnabled:   cfg.TrustedMFAEnabled,
+		AssuranceLookup:     assuranceLookup,
+		MFAAssertionHMACKey: cfg.MFAAssertionHMACKey,
+		Log:                 log,
+		GatewayZone:         cfg.GatewayZone,
+		SessionCookieName:   oidc.DefaultCookieName,
 	}
 	// Rebuild the request handler from the (hot-reloading) route store whenever
 	// the route set changes, so DB route edits — e.g. a new SiteFlow deployment
@@ -166,6 +182,8 @@ func main() {
 		"audit", cfg.AuditEnabled,
 		"waf", cfg.WAFEnabled,
 		"rbac", authz.Enabled(),
+		"trusted_mfa", cfg.TrustedMFAEnabled,
+		"trusted_mfa_lookup", assuranceLookup != nil,
 		"public_only", cfg.PublicOnly,
 		"gateway_zone", cfg.GatewayZone,
 	)
@@ -173,6 +191,36 @@ func main() {
 		log.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func buildAssuranceLookup(cfg *config.Config, internalClient *http.Client, log *slog.Logger) oidc.AssuranceLookup {
+	if !cfg.TrustedMFAEnabled {
+		return nil
+	}
+	// When internal mTLS was explicitly requested, silently falling back to a
+	// plain client would weaken the lookup channel. Keep the process healthy but
+	// make every affected SSO route return 503 until the transport is repaired.
+	if cfg.InternalMTLS && internalClient == nil {
+		log.Error("trusted MFA lookup unavailable (internal mTLS client missing); sso routes will 503")
+		return nil
+	}
+	if cfg.InternalMTLS {
+		endpoint, err := url.Parse(cfg.KeystoneAssuranceURL)
+		if err != nil || endpoint.Scheme != "https" {
+			log.Error("trusted MFA lookup unavailable (internal mTLS requires HTTPS); sso routes will 503")
+			return nil
+		}
+	}
+	lookup, err := oidc.NewKeystoneAssuranceClient(oidc.AssuranceClientConfig{
+		Endpoint:     cfg.KeystoneAssuranceURL,
+		ServiceToken: cfg.KeystoneAssuranceServiceToken,
+		Client:       internalClient,
+	})
+	if err != nil {
+		log.Error("trusted MFA lookup unavailable; sso routes will 503", "error", err)
+		return nil
+	}
+	return lookup
 }
 
 // buildPATIntrospector wires opaque-PAT auth whenever its explicit endpoint is
@@ -334,15 +382,16 @@ func buildProvider(cfg *config.Config, jwks *auth.JWKSCache, client *http.Client
 	}
 
 	provider, err := oidc.NewProvider(oidc.Config{
-		Issuer:        cfg.OIDCIssuer,
-		TokenURL:      cfg.GWTokenURL,
-		ClientID:      cfg.GWClientID,
-		ClientSecret:  cfg.GWClientSecret,
-		RedirectURI:   cfg.GWRedirectURI,
-		SessionTTL:    cfg.GWSessionTTL,
-		SessionSecret: cfg.GWSessionSecret,
-		CookieDomain:  cfg.CookieDomain,
-		Auditor:       auditor,
+		Issuer:                 cfg.OIDCIssuer,
+		TokenURL:               cfg.GWTokenURL,
+		ClientID:               cfg.GWClientID,
+		ClientSecret:           cfg.GWClientSecret,
+		RedirectURI:            cfg.GWRedirectURI,
+		SessionTTL:             cfg.GWSessionTTL,
+		SessionSecret:          cfg.GWSessionSecret,
+		SessionRevocationToken: cfg.GWSessionRevocationToken,
+		CookieDomain:           cfg.CookieDomain,
+		Auditor:                auditor,
 	}, jwks, client, sessions, states, log)
 	if err != nil {
 		log.Error("oidc browser SSO disabled (provider build failed); sso routes will 503", "error", err)

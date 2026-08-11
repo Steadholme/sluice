@@ -3,6 +3,7 @@ package gateway
 import (
 	"net/http"
 	"net/http/httputil"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,7 +46,13 @@ const (
 // When mtls is non-nil and the upstream is https (the internal Keystone hop under
 // INTERNAL_MTLS=on), the proxy uses the mTLS transport so it presents the Keyward
 // client certificate; plain-http upstreams keep the default transport unchanged.
-func newReverseProxy(route config.Route, mtls *http.Transport, identityHMACKey, zoneHMACKey, gatewayZone, sessionCookie string) *httputil.ReverseProxy {
+func newReverseProxy(
+	route config.Route,
+	mtls *http.Transport,
+	identityHMACKey, zoneHMACKey, authzHMACKey string,
+	authzContextV2Keys auth.AuthorizationContextV2Keyring,
+	gatewayZone, sessionCookie string,
+) *httputil.ReverseProxy {
 	target := route.UpstreamURL()
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -105,6 +112,58 @@ func newReverseProxy(route config.Route, mtls *http.Transport, identityHMACKey, 
 						pr.Out.Header.Set(auth.HeaderAuthScopeSig, sig)
 					}
 				}
+			}
+			if decision, ok := auth.AuthorizationFromContext(pr.In.Context()); ok {
+				if sig := auth.SignAuthorizationContext(authzHMACKey, decision); sig != "" {
+					pr.Out.Header.Set(auth.HeaderAuthPermission, decision.Permission)
+					pr.Out.Header.Set(auth.HeaderAuthObject, decision.Object)
+					pr.Out.Header.Set(auth.HeaderAuthDecision, decision.Decision)
+					pr.Out.Header.Set(auth.HeaderAuthDecisionID, decision.DecisionID)
+					pr.Out.Header.Set(auth.HeaderAuthRevocationEpoch, strconv.FormatInt(decision.RevocationEpoch, 10))
+					pr.Out.Header.Set(auth.HeaderAuthContextTime, strconv.FormatInt(decision.Timestamp, 10))
+					pr.Out.Header.Set(auth.HeaderAuthContextSig, sig)
+				}
+				if resourceType, resourceID, validResource := strings.Cut(decision.Object, ":"); validResource {
+					signed, err := auth.MintAuthorizationContextV2(authzContextV2Keys, auth.AuthorizationContextV2{
+						Issuer:          auth.AuthorizationContextV2Issuer,
+						Subject:         decision.Subject,
+						Route:           route.Name,
+						Audience:        route.Match.Host,
+						Zone:            gatewayZone,
+						Permission:      decision.Permission,
+						ResourceVersion: "1",
+						ResourceType:    resourceType,
+						ResourceID:      resourceID,
+						Risk:            decision.Risk,
+						Decision:        decision.Decision,
+						DecisionID:      decision.DecisionID,
+						PolicyEpoch:     decision.RevocationEpoch,
+						IssuedAt:        decision.Timestamp,
+						Expiry:          decision.Timestamp + auth.AuthorizationContextV2TTL,
+					})
+					if err == nil {
+						for header, value := range signed.Headers() {
+							pr.Out.Header.Set(header, value)
+						}
+					}
+				}
+			}
+			if assertion, signature, ok := auth.MFAAssertionFromContext(pr.In.Context()); ok {
+				uv := "0"
+				if assertion.UV {
+					uv = "1"
+				}
+				pr.Out.Header.Set(auth.HeaderAuthMFASubject, assertion.Subject)
+				pr.Out.Header.Set(auth.HeaderAuthMFAAAL, assertion.AAL)
+				pr.Out.Header.Set(auth.HeaderAuthMFAUV, uv)
+				pr.Out.Header.Set(auth.HeaderAuthMFAAuthTime, strconv.FormatInt(assertion.AuthTime, 10))
+				pr.Out.Header.Set(auth.HeaderAuthMFASessionBinding, assertion.SessionBinding)
+				pr.Out.Header.Set(auth.HeaderAuthMFAFactorEpoch, strconv.FormatInt(assertion.FactorEpoch, 10))
+				pr.Out.Header.Set(auth.HeaderAuthMFARoute, assertion.Route)
+				pr.Out.Header.Set(auth.HeaderAuthMFAAudience, assertion.Audience)
+				pr.Out.Header.Set(auth.HeaderAuthMFAEvidence, assertion.Evidence)
+				pr.Out.Header.Set(auth.HeaderAuthMFATimestamp, strconv.FormatInt(assertion.Timestamp, 10))
+				pr.Out.Header.Set(auth.HeaderAuthMFASig, signature)
 			}
 		},
 	}

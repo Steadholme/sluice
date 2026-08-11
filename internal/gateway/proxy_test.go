@@ -333,7 +333,7 @@ func TestNonPATRouteWithIdentityDoesNotInjectScopeSignature(t *testing.T) {
 		Upstream: upstream.URL,
 		Auth:     config.AuthBearer,
 	}})
-	proxy := newReverseProxy(store.Routes()[0], nil, "identity-hmac-key", "", "external", "")
+	proxy := newReverseProxy(store.Routes()[0], nil, "identity-hmac-key", "", "", auth.AuthorizationContextV2Keyring{}, "external", "")
 	req := httptest.NewRequest(http.MethodGet, "http://api.example/resource", nil)
 	req.Host = "api.example"
 	req.Header.Set(auth.HeaderAuthScopeSig, "forged")
@@ -353,6 +353,146 @@ func TestNonPATRouteWithIdentityDoesNotInjectScopeSignature(t *testing.T) {
 	}
 	if got.scopeSignature != "" {
 		t.Fatalf("non-PAT identity received %s = %q, want absent", auth.HeaderAuthScopeSig, got.scopeSignature)
+	}
+}
+
+func TestAllowedPermissionContextIsSignedAndSpoofedHeadersAreReplaced(t *testing.T) {
+	seen := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	route := mustRoutes(t, []config.Route{{
+		Name:     "cpa-root",
+		Match:    config.Match{Host: "cpa.example", PathPrefix: "/"},
+		Upstream: upstream.URL,
+		Auth:     config.AuthSSO,
+	}}).Routes()[0]
+	proxy := newReverseProxy(route, nil, "", "", "authz-key", auth.AuthorizationContextV2Keyring{}, "internal", "")
+	req := httptest.NewRequest(http.MethodGet, "http://cpa.example/", nil)
+	req.Host = "cpa.example"
+	for _, header := range []string{
+		auth.HeaderAuthPermission,
+		auth.HeaderAuthObject,
+		auth.HeaderAuthDecision,
+		auth.HeaderAuthDecisionID,
+		auth.HeaderAuthRevocationEpoch,
+		auth.HeaderAuthContextTime,
+		auth.HeaderAuthContextSig,
+	} {
+		req.Header.Set(header, "forged")
+	}
+	decision := auth.AuthorizationContext{
+		Permission:      "cpa.console.enter",
+		Object:          "route:cpa-root",
+		Decision:        "Allow",
+		DecisionID:      "dec_123",
+		RevocationEpoch: 42,
+		Timestamp:       1_765_000_000,
+	}
+	req = req.WithContext(auth.ContextWithAuthorization(req.Context(), decision))
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", recorder.Code)
+	}
+	headers := <-seen
+	if headers.Get(auth.HeaderAuthPermission) != decision.Permission ||
+		headers.Get(auth.HeaderAuthObject) != decision.Object ||
+		headers.Get(auth.HeaderAuthDecision) != "Allow" ||
+		headers.Get(auth.HeaderAuthDecisionID) != decision.DecisionID ||
+		headers.Get(auth.HeaderAuthRevocationEpoch) != "42" ||
+		headers.Get(auth.HeaderAuthContextTime) != "1765000000" {
+		t.Fatalf("authorization headers = %#v", headers)
+	}
+	if got := headers.Get(auth.HeaderAuthContextSig); got == "" || got == "forged" {
+		t.Fatalf("authorization signature = %q", got)
+	}
+}
+
+func TestAllowedPermissionContextDualWritesCompleteV2Headers(t *testing.T) {
+	seen := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	route := mustRoutes(t, []config.Route{{
+		Name:     "cpa-root",
+		Match:    config.Match{Host: "cpa.w33d.xyz", PathPrefix: "/"},
+		Upstream: upstream.URL,
+		Auth:     config.AuthSSO,
+	}}).Routes()[0]
+	keyring := auth.AuthorizationContextV2Keyring{
+		Current: auth.AuthorizationContextV2Key{
+			KID: "authz2-2026a",
+			Key: "authz2-ctx-golden-key-0123456789abcdef",
+		},
+		Previous: auth.AuthorizationContextV2Key{
+			KID: "authz2-2025h",
+			Key: "authz2-ctx-golden-prev-0123456789abcdef",
+		},
+	}
+	proxy := newReverseProxy(route, nil, "", "", "legacy-authz-key", keyring, "internal", "")
+	req := httptest.NewRequest(http.MethodGet, "http://cpa.w33d.xyz/", nil)
+	req.Host = "cpa.w33d.xyz"
+	v2Headers := []string{
+		auth.HeaderAuthContextV2KID,
+		auth.HeaderAuthContextV2Issuer,
+		auth.HeaderAuthContextV2Subject,
+		auth.HeaderAuthContextV2Route,
+		auth.HeaderAuthContextV2Audience,
+		auth.HeaderAuthContextV2Zone,
+		auth.HeaderAuthContextV2Permission,
+		auth.HeaderAuthContextV2ResourceVersion,
+		auth.HeaderAuthContextV2ResourceType,
+		auth.HeaderAuthContextV2ResourceID,
+		auth.HeaderAuthContextV2Risk,
+		auth.HeaderAuthContextV2Decision,
+		auth.HeaderAuthContextV2DecisionID,
+		auth.HeaderAuthContextV2PolicyEpoch,
+		auth.HeaderAuthContextV2IssuedAt,
+		auth.HeaderAuthContextV2Expiry,
+		auth.HeaderAuthContextV2Signature,
+	}
+	for _, header := range v2Headers {
+		req.Header.Add(header, "forged-one")
+		req.Header.Add(header, "forged-two")
+	}
+	decision := auth.AuthorizationContext{
+		Permission:      "cpa.console.enter",
+		Object:          "route:cpa-root",
+		Decision:        "Allow",
+		DecisionID:      "dec_0123456789abcdef0123456789abcdef",
+		RevocationEpoch: 42,
+		Timestamp:       1_765_000_000,
+		Subject:         "user:alice",
+		Risk:            "critical",
+	}
+	req = req.WithContext(auth.ContextWithAuthorization(req.Context(), decision))
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", recorder.Code)
+	}
+	headers := <-seen
+	for _, header := range v2Headers {
+		if values := headers.Values(header); len(values) != 1 || values[0] == "forged-one" || values[0] == "forged-two" {
+			t.Fatalf("%s values = %q, want one Sluice-minted value", header, values)
+		}
+	}
+	const wantSignature = "bc5d6152f44d7c4ca8110e7eac191bce169d9b46a0de7dcfdc67839ddbb03929"
+	if got := headers.Get(auth.HeaderAuthContextV2Signature); got != wantSignature {
+		t.Fatalf("v2 signature = %q, want %q", got, wantSignature)
+	}
+	if headers.Get(auth.HeaderAuthContextV2Subject) != "user:alice" ||
+		headers.Get(auth.HeaderAuthContextV2Audience) != "cpa.w33d.xyz" ||
+		headers.Get(auth.HeaderAuthContextV2Expiry) != "1765000090" {
+		t.Fatalf("unexpected v2 context: %#v", headers)
+	}
+	if headers.Get(auth.HeaderAuthContextSig) == "" {
+		t.Fatal("legacy v1 authorization context was not preserved during v2 dual-write")
 	}
 }
 

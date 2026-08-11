@@ -1,0 +1,43 @@
+{
+  "id": "exp-20260806-111031-ts8e",
+  "startedAt": "2026-08-06T09:10:31.803Z",
+  "cwd": "/root/w33d_infra/sluice",
+  "prompts": [
+    "FIND: Keystone session and identity ingestion paths that authenticate requests and derive trusted subject, groups, or claims\\nSCOPE: src/, tests/, Cargo.toml\\nATTENTION: Rust gateway named Sluice; distinguish client-supplied headers from Keystone-derived identity\\nEXPECTED: file:line map with data flow and trust source",
+    "FIND: Proxy request construction that removes inbound X-Auth-* headers and adds signed outbound identity headers\\nSCOPE: src/, tests/\\nATTENTION: Rust; identify canonicalization, signature algorithm, key/config source, route-dependent behavior, and exact preimage\\nEXPECTED: file:line map plus exact signed fields in order",
+    "FIND: Nonce, timestamp, freshness, replay prevention, SSO claim forwarding, MFA, auth_time, AMR, ACR, or evidence digest logic and associated tests\\nSCOPE: src/, tests/\\nATTENTION: Include absent-but-relevant coverage and routes to Access or NewAPI\\nEXPECTED: file:line findings, test names, and gaps"
+  ],
+  "endpoints": [
+    "k3"
+  ],
+  "totalJobs": 3,
+  "concurrency": 4,
+  "maxTurns": 6,
+  "durationMs": 2087,
+  "results": [
+    {
+      "id": "explore-1",
+      "prompt": "FIND: Keystone session and identity ingestion paths that authenticate requests and derive trusted subject, groups, or claims\\nSCOPE: src/, tests/, Cargo.toml\\nATTENTION: Rust gateway named Sluice; distinguish client-supplied headers from Keystone-derived identity\\nEXPECTED: file:line map with data flow and trust source",
+      "endpointName": "k3",
+      "model": "k3",
+      "content": "LLM API error: Anthropic API 403: {\"error\":{\"type\":\"permission_error\",\"message\":\"You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/code/#pricing\"},\"type\":\"error\"}",
+      "durationMs": 1075
+    },
+    {
+      "id": "explore-2",
+      "prompt": "FIND: Proxy request construction that removes inbound X-Auth-* headers and adds signed outbound identity headers\\nSCOPE: src/, tests/\\nATTENTION: Rust; identify canonicalization, signature algorithm, key/config source, route-dependent behavior, and exact preimage\\nEXPECTED: file:line map plus exact signed fields in order",
+      "endpointName": "k3",
+      "model": "k3",
+      "content": "LLM API error: Anthropic API 403: {\"error\":{\"type\":\"permission_error\",\"message\":\"You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/code/#pricing\"},\"type\":\"error\"}",
+      "durationMs": 533
+    },
+    {
+      "id": "explore-3",
+      "prompt": "FIND: Nonce, timestamp, freshness, replay prevention, SSO claim forwarding, MFA, auth_time, AMR, ACR, or evidence digest logic and associated tests\\nSCOPE: src/, tests/\\nATTENTION: Include absent-but-relevant coverage and routes to Access or NewAPI\\nEXPECTED: file:line findings, test names, and gaps",
+      "endpointName": "k3",
+      "model": "k3",
+      "content": "LLM API error: Anthropic API 403: {\"error\":{\"type\":\"permission_error\",\"message\":\"You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/code/#pricing\"},\"type\":\"error\"}",
+      "durationMs": 476
+    }
+  ]
+}

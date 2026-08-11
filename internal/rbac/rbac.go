@@ -1,10 +1,9 @@
 // Package rbac adds per-route group authorization on top of Sluice's SSO
 // identity. An `auth=sso` route may carry a required group (routes.require_group);
 // when it does, the authenticated caller must be a member of that group, decided
-// by consulting Verdict (the ReBAC PDP) over the internal network. It is fully
-// opt-in: a route with no require_group, or a disabled/unconfigured Authorizer,
-// is a byte-identical pass-through, so the public ingress behavior is unchanged
-// until both the route flag and RBAC_ENABLED are set.
+// by consulting Verdict (the ReBAC PDP) over the internal network. A route with
+// no require_group remains opt-in and backward compatible; a route that declares
+// require_group must fail closed when the Authorizer is unavailable.
 //
 // The gate runs AFTER the SSO middleware has established identity (so the subject
 // is present) and BEFORE the reverse proxy, stamping the subject's groups onto
@@ -16,7 +15,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"html"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -32,7 +30,7 @@ type Config struct {
 	// VerdictURL is the base URL of the Verdict decision point, e.g.
 	// http://verdict:9140. The Authorizer POSTs to {VerdictURL}/api/list-objects.
 	VerdictURL string
-	// Token is the VERDICT_SERVICE_TOKEN presented as a Bearer credential.
+	// Token is the VERDICT_DECISION_TOKEN presented as a Bearer credential.
 	Token string
 	// TTL is the per-subject membership cache lifetime (default 5m).
 	TTL time.Duration
@@ -41,14 +39,15 @@ type Config struct {
 
 // Authorizer decides whether an authenticated subject may reach a group-gated
 // route and looks up the subject's groups for X-Auth-Groups. Results are cached
-// per subject with a short TTL; on a Verdict outage a stale cache entry is served
-// (graceful) while a cold miss fails closed (deny), so a compromised or missing
-// PDP never silently opens the mgmt consoles.
+// per subject with a short TTL. Expired entries are never authorization evidence:
+// if Verdict is unavailable after expiry, the strict Gate fails closed while the
+// advisory InjectOnly path simply omits group decoration.
 type Authorizer struct {
 	cfg    Config
 	client *http.Client
 	mu     sync.Mutex
 	cache  map[string]cacheEntry
+	now    func() time.Time
 }
 
 type cacheEntry struct {
@@ -70,6 +69,7 @@ func New(cfg Config) *Authorizer {
 		cfg:    cfg,
 		client: &http.Client{Timeout: 5 * time.Second},
 		cache:  make(map[string]cacheEntry),
+		now:    time.Now,
 	}
 }
 
@@ -85,21 +85,21 @@ func (a *Authorizer) Gate(group string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, ok := auth.IdentityFromContext(r.Context())
 		if !ok || id.Subject == "" {
-			a.forbidden(w, group, "no established identity")
+			a.forbidden(w, group)
 			return
 		}
 		subject := "user:" + id.Subject
 		groups, err := a.groupsFor(r.Context(), subject)
 		if err != nil {
-			// Fail closed: membership cannot be verified -> deny.
-			a.cfg.Log.Warn("rbac deny (verdict unavailable)", "subject", id.Subject, "group", group, "error", err)
-			a.forbidden(w, group, "authorization service unavailable")
+			// Fail closed without disguising an unavailable PDP as a policy deny.
+			a.cfg.Log.Warn("rbac indeterminate (verdict unavailable)", "subject", id.Subject, "group", group, "error", err)
+			a.unavailable(w, group)
 			return
 		}
 		id.Groups = stripPrefix(groups)
 		if !contains(groups, "group:"+group) {
 			a.cfg.Log.Info("rbac deny (not a member)", "subject", id.Subject, "group", group)
-			a.forbidden(w, group, "your account is not a member of this group")
+			a.forbidden(w, group)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -123,26 +123,24 @@ func (a *Authorizer) InjectOnly(next http.Handler) http.Handler {
 }
 
 // groupsFor returns the raw group object ids the subject is a member of, backed
-// by a per-subject TTL cache. On a Verdict error a stale entry is returned if
-// present (so a transient blip does not lock out an already-verified admin); a
-// cold miss returns the error so Gate fails closed.
+// by a per-subject TTL cache. Once an entry expires it cannot be used to authorize
+// a request. Verdict errors are returned to the caller so Gate can fail closed;
+// InjectOnly remains advisory and ignores the error.
 func (a *Authorizer) groupsFor(ctx context.Context, subject string) ([]string, error) {
+	now := a.now()
 	a.mu.Lock()
 	ent, cached := a.cache[subject]
-	fresh := cached && time.Since(ent.at) < a.cfg.TTL
+	fresh := cached && now.Sub(ent.at) >= 0 && now.Sub(ent.at) < a.cfg.TTL
 	a.mu.Unlock()
 	if fresh {
 		return ent.groups, nil
 	}
 	groups, err := a.fetchGroups(ctx, subject)
 	if err != nil {
-		if cached {
-			return ent.groups, nil // serve stale rather than lock out on a blip
-		}
 		return nil, err
 	}
 	a.mu.Lock()
-	a.cache[subject] = cacheEntry{groups: groups, at: time.Now()}
+	a.cache[subject] = cacheEntry{groups: groups, at: a.now()}
 	a.mu.Unlock()
 	return groups, nil
 }
@@ -175,24 +173,12 @@ func (a *Authorizer) fetchGroups(ctx context.Context, subject string) ([]string,
 	return out.Objects, nil
 }
 
-const forbiddenHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>403 · Steadholme</title>
-<style>body{font:16px/1.5 system-ui,sans-serif;background:#f4f4f4;color:#272727;margin:0;
-display:flex;min-height:100vh;align-items:center;justify-content:center}
-.card{background:#fff;border:1px solid #e1e1e1;border-radius:12px;padding:40px 44px;max-width:460px;text-align:center}
-h1{font-size:20px;font-weight:600;margin:0 0 8px}p{color:#6e6e6e;margin:6px 0}
-code{background:#f2f3fd;color:#4c64e1;padding:2px 6px;border-radius:4px}
-a{color:#4c64e1;text-decoration:none}</style></head>
-<body><div class="card"><h1>403 — Access restricted</h1>
-<p>This console requires membership of the <code>%s</code> group.</p>
-<p>%s</p>
-<p style="margin-top:20px"><a href="https://w33d.xyz">← All apps</a></p></div></body></html>`
+func (a *Authorizer) forbidden(w http.ResponseWriter, group string) {
+	writeDenial(w, groupDeniedPage(group))
+}
 
-func (a *Authorizer) forbidden(w http.ResponseWriter, group, reason string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusForbidden)
-	fmt.Fprintf(w, forbiddenHTML, html.EscapeString(group), html.EscapeString(reason))
+func (a *Authorizer) unavailable(w http.ResponseWriter, group string) {
+	writeDenial(w, accessUnverifiedPage("Required group", group))
 }
 
 func contains(xs []string, x string) bool {

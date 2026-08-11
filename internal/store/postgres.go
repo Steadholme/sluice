@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,7 +16,11 @@ import (
 
 // reloadInterval is how often the background reloader re-reads the routes table
 // so that DB route edits take effect without a process restart.
-const reloadInterval = 20 * time.Second
+const (
+	reloadInterval                 = 20 * time.Second
+	postgresSchemaMigrationLockKey = "sluice:postgres-schema-migrations:v1"
+	postgresSchemaMigrationLockSQL = `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`
+)
 
 // schemaDDL creates the routes table using only portable SQL so the same layer
 // runs unchanged on FusionDB over pgwire: TEXT/BOOLEAN columns, plain PRIMARY
@@ -32,7 +37,12 @@ CREATE TABLE IF NOT EXISTS routes (
     auth          TEXT    NOT NULL DEFAULT '',
     waf           BOOLEAN NOT NULL DEFAULT FALSE,
     require_group TEXT    NOT NULL DEFAULT '',
-    require_scope TEXT    NOT NULL DEFAULT ''
+	internal_only BOOLEAN NOT NULL DEFAULT FALSE,
+	require_permission TEXT NOT NULL DEFAULT '',
+	permission_resource TEXT NOT NULL DEFAULT '',
+	risk TEXT NOT NULL DEFAULT '',
+    require_scope TEXT    NOT NULL DEFAULT '',
+    step_up_resume_path TEXT NOT NULL DEFAULT ''
 )`
 
 // addAuthColumnDDL backfills the auth column on a pre-existing routes table (one
@@ -49,22 +59,28 @@ const addAuthColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS auth TEXT 
 const addWafColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS waf BOOLEAN NOT NULL DEFAULT FALSE`
 
 // addRequireGroupColumnDDL backfills the RBAC require_group column the same way.
-// Idempotent; existing rows default to '' so no route is group-gated until it is
+// Idempotent; existing rows default to ” so no route is group-gated until it is
 // explicitly set, keeping behavior unchanged.
 const addRequireGroupColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS require_group TEXT NOT NULL DEFAULT ''`
+
+const addInternalOnlyColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS internal_only BOOLEAN NOT NULL DEFAULT FALSE`
+const addRequirePermissionColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS require_permission TEXT NOT NULL DEFAULT ''`
+const addPermissionResourceColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS permission_resource TEXT NOT NULL DEFAULT ''`
+const addRiskColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS risk TEXT NOT NULL DEFAULT ''`
 
 // addRequireScopeColumnDDL adds the isolated PAT authorization requirement.
 // Existing rows default to empty, which is valid for every pre-PAT auth mode;
 // config validation rejects empty scope only when a route explicitly selects
 // auth="pat".
 const addRequireScopeColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS require_scope TEXT NOT NULL DEFAULT ''`
+const addStepUpResumePathColumnDDL = `ALTER TABLE routes ADD COLUMN IF NOT EXISTS step_up_resume_path TEXT NOT NULL DEFAULT ''`
 
 const (
 	countRoutesSQL = `SELECT count(*) FROM routes`
-	upsertRouteSQL = `INSERT INTO routes (name, host, path_prefix, upstream, protected, auth, waf, require_group, require_scope)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	upsertRouteSQL = `INSERT INTO routes (name, host, path_prefix, upstream, protected, auth, waf, require_group, internal_only, require_permission, permission_resource, risk, require_scope, step_up_resume_path)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	ON CONFLICT (name) DO NOTHING`
-	selectRoutesSQL = `SELECT name, host, path_prefix, upstream, protected, auth, waf, require_group, require_scope
+	selectRoutesSQL = `SELECT name, host, path_prefix, upstream, protected, auth, waf, require_group, internal_only, require_permission, permission_resource, risk, require_scope, step_up_resume_path
 	FROM routes ORDER BY name`
 )
 
@@ -96,6 +112,9 @@ type PostgresStore struct {
 	// cancel stops the background reloader; done is closed when it has exited.
 	cancel context.CancelFunc
 	done   chan struct{}
+
+	changes    chan uint64
+	generation atomic.Uint64
 }
 
 // NewPostgresStore connects to dsn, runs the idempotent migration, seeds the
@@ -116,7 +135,7 @@ func NewPostgresStore(ctx context.Context, dsn string, seed []config.Route) (*Po
 		return nil, fmt.Errorf("store: ping postgres: %w", err)
 	}
 
-	s := &PostgresStore{pool: pool}
+	s := &PostgresStore{pool: pool, changes: make(chan uint64, 1)}
 	s.fetch = s.queryRoutes
 	if err := s.migrate(ctx); err != nil {
 		pool.Close()
@@ -152,6 +171,8 @@ func (s *PostgresStore) Routes() []config.Route {
 	defer s.mu.RUnlock()
 	return s.routes
 }
+
+func (s *PostgresStore) RouteChanges() <-chan uint64 { return s.changes }
 
 // Close stops the background reloader and releases the connection pool. It waits
 // for the reloader to exit before closing the pool so no in-flight reload query
@@ -191,20 +212,46 @@ func (s *PostgresStore) reloadLoop(ctx context.Context) {
 }
 
 func (s *PostgresStore) migrate(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, schemaDDL); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: begin routes migration: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if _, err := tx.Exec(ctx, postgresSchemaMigrationLockSQL, postgresSchemaMigrationLockKey); err != nil {
+		return fmt.Errorf("store: lock routes migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, schemaDDL); err != nil {
 		return fmt.Errorf("store: migrate routes table: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, addAuthColumnDDL); err != nil {
+	if _, err := tx.Exec(ctx, addAuthColumnDDL); err != nil {
 		return fmt.Errorf("store: add auth column: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, addWafColumnDDL); err != nil {
+	if _, err := tx.Exec(ctx, addWafColumnDDL); err != nil {
 		return fmt.Errorf("store: add waf column: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, addRequireGroupColumnDDL); err != nil {
+	if _, err := tx.Exec(ctx, addRequireGroupColumnDDL); err != nil {
 		return fmt.Errorf("store: add require_group column: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, addRequireScopeColumnDDL); err != nil {
+	if _, err := tx.Exec(ctx, addInternalOnlyColumnDDL); err != nil {
+		return fmt.Errorf("store: add internal_only column: %w", err)
+	}
+	if _, err := tx.Exec(ctx, addRequirePermissionColumnDDL); err != nil {
+		return fmt.Errorf("store: add require_permission column: %w", err)
+	}
+	if _, err := tx.Exec(ctx, addPermissionResourceColumnDDL); err != nil {
+		return fmt.Errorf("store: add permission_resource column: %w", err)
+	}
+	if _, err := tx.Exec(ctx, addRiskColumnDDL); err != nil {
+		return fmt.Errorf("store: add risk column: %w", err)
+	}
+	if _, err := tx.Exec(ctx, addRequireScopeColumnDDL); err != nil {
 		return fmt.Errorf("store: add require_scope column: %w", err)
+	}
+	if _, err := tx.Exec(ctx, addStepUpResumePathColumnDDL); err != nil {
+		return fmt.Errorf("store: add step_up_resume_path column: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: commit routes migration: %w", err)
 	}
 	return nil
 }
@@ -245,6 +292,11 @@ func (s *PostgresStore) load(ctx context.Context) error {
 	s.mu.Lock()
 	s.routes = loaded
 	s.mu.Unlock()
+	generation := s.generation.Add(1)
+	select {
+	case s.changes <- generation:
+	default:
+	}
 	return nil
 }
 
@@ -263,7 +315,22 @@ func (s *PostgresStore) queryRoutes(ctx context.Context) ([]config.Route, error)
 	var loaded []config.Route
 	for rows.Next() {
 		var r config.Route
-		if err := rows.Scan(&r.Name, &r.Match.Host, &r.Match.PathPrefix, &r.Upstream, &r.Protected, &r.Auth, &r.Waf, &r.RequireGroup, &r.RequireScope); err != nil {
+		if err := rows.Scan(
+			&r.Name,
+			&r.Match.Host,
+			&r.Match.PathPrefix,
+			&r.Upstream,
+			&r.Protected,
+			&r.Auth,
+			&r.Waf,
+			&r.RequireGroup,
+			&r.InternalOnly,
+			&r.RequirePermission,
+			&r.PermissionResource,
+			&r.Risk,
+			&r.RequireScope,
+			&r.StepUpResumePath,
+		); err != nil {
 			return nil, fmt.Errorf("store: scan route: %w", err)
 		}
 		loaded = append(loaded, r)
@@ -296,6 +363,11 @@ func routeValues(r config.Route) []any {
 		r.Auth,
 		r.Waf,
 		r.RequireGroup,
+		r.InternalOnly,
+		r.RequirePermission,
+		r.PermissionResource,
+		r.Risk,
 		r.RequireScope,
+		r.StepUpResumePath,
 	}
 }

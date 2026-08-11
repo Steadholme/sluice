@@ -168,3 +168,32 @@ func TestRouterNoMatch(t *testing.T) {
 		t.Error("expected no match for /nope")
 	}
 }
+
+func TestStepUpRouteRequiresSingleExactHostOwner(t *testing.T) {
+	route := config.Route{
+		Name:             "access-root",
+		Match:            config.Match{Host: "access.w33d.xyz", PathPrefix: "/"},
+		Upstream:         "http://127.0.0.1:9390",
+		Auth:             config.AuthSSO,
+		StepUpResumePath: "/request/scope/step-up/",
+	}
+	router := NewRouter(mustRoutes(t, []config.Route{
+		route,
+		{Name: "fallback", Match: config.Match{PathPrefix: "/"}, Upstream: "http://127.0.0.1:1"},
+	}))
+	got, ok := router.StepUpRoute("access.w33d.xyz")
+	if !ok || got.Name != route.Name {
+		t.Fatalf("StepUpRoute = (%+v,%t), want access-root", got, ok)
+	}
+	if _, ok := router.StepUpRoute("other.w33d.xyz"); ok {
+		t.Fatal("foreign host resolved a step-up route")
+	}
+
+	duplicate := route
+	duplicate.Name = "access-api"
+	duplicate.Match.PathPrefix = "/api/"
+	router = NewRouter(mustRoutes(t, []config.Route{route, duplicate}))
+	if _, ok := router.StepUpRoute("access.w33d.xyz"); ok {
+		t.Fatal("duplicate step-up route owners did not fail closed")
+	}
+}

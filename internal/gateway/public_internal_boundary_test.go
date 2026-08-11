@@ -99,3 +99,28 @@ func TestPublicOnlyInternalBoundaryDoesNotClaimSimilarPaths(t *testing.T) {
 		}
 	}
 }
+
+func TestInternalOnlyRouteIsAlwaysAbsentFromPublicPlane(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("internal-only route reached upstream from public plane")
+	}))
+	defer upstream.Close()
+	routes := mustRoutes(t, []config.Route{{
+		Name:         "vpn-root",
+		Match:        config.Match{Host: "vpn.example", PathPrefix: "/"},
+		Upstream:     upstream.URL,
+		Auth:         config.AuthPublic,
+		InternalOnly: true,
+	}})
+	handler := NewServer(routes, Options{
+		PublicOnly:           true,
+		PublicOnlyAllowHosts: map[string]bool{"vpn.example": true},
+	}).Handler()
+	req := httptest.NewRequest(http.MethodGet, "http://vpn.example/", nil)
+	req.Host = "vpn.example"
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+}

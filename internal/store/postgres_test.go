@@ -38,9 +38,10 @@ func TestStaticStorePreservesPATRouteFields(t *testing.T) {
 
 func TestPostgresRoutePersistenceIncludesRequireScope(t *testing.T) {
 	route := seedRoutes()[2]
+	route.StepUpResumePath = "/request/scope/step-up/"
 	values := routeValues(route)
-	if len(values) != 9 || values[8] != route.RequireScope {
-		t.Fatalf("routeValues = %#v, want require_scope at position 9", values)
+	if len(values) != 14 || values[12] != route.RequireScope || values[13] != route.StepUpResumePath {
+		t.Fatalf("routeValues = %#v, want require_scope at position 13", values)
 	}
 	for name, sql := range map[string]string{
 		"schema":  schemaDDL,
@@ -51,6 +52,61 @@ func TestPostgresRoutePersistenceIncludesRequireScope(t *testing.T) {
 		if !strings.Contains(sql, "require_scope") {
 			t.Errorf("%s SQL omits require_scope: %s", name, sql)
 		}
+	}
+	for name, sql := range map[string]string{
+		"schema": schemaDDL, "migrate": addStepUpResumePathColumnDDL,
+		"upsert": upsertRouteSQL, "select": selectRoutesSQL,
+	} {
+		if !strings.Contains(sql, "step_up_resume_path") {
+			t.Errorf("%s SQL omits step_up_resume_path: %s", name, sql)
+		}
+	}
+}
+
+func TestPostgresStoreConcurrentSchemaMigration(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping concurrent postgres migration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DROP TABLE IF EXISTS routes"); err != nil {
+		pool.Close()
+		t.Fatalf("drop routes: %v", err)
+	}
+	pool.Close()
+
+	type migrationResult struct {
+		store *PostgresStore
+		err   error
+	}
+	const concurrentStores = 8
+	start := make(chan struct{})
+	results := make(chan migrationResult, concurrentStores)
+	for range concurrentStores {
+		go func() {
+			<-start
+			store, migrateErr := NewPostgresStore(ctx, dsn, seedRoutes())
+			results <- migrationResult{store: store, err: migrateErr}
+		}()
+	}
+	close(start)
+	stores := make([]*PostgresStore, 0, concurrentStores)
+	defer func() {
+		for _, store := range stores {
+			store.Close()
+		}
+	}()
+	for range concurrentStores {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent NewPostgresStore: %v", result.err)
+		}
+		stores = append(stores, result.store)
 	}
 }
 

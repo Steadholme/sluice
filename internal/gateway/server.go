@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/holdfast/sluice/internal/accesslog"
 	"github.com/holdfast/sluice/internal/audit"
@@ -45,8 +47,9 @@ type Options struct {
 	Transport       *http.Transport
 	Auditor         *audit.Emitter
 	WAF             *waf.Engine
-	// Authz is the optional Verdict-backed RBAC authorizer. When nil or disabled,
-	// per-route require_group gating is a no-op (nil-safe via Enabled()).
+	// Authz is the optional Verdict-backed RBAC authorizer. Plain SSO routes keep
+	// working when it is nil or disabled, but a route declaring require_group
+	// fails closed with 503 until the authorizer is fully configured.
 	Authz *rbac.Authorizer
 	// PublicOnly, when true, builds a PUBLIC-facing gateway that omits every
 	// internal (require_group) route — the router never matches them, so they 404.
@@ -64,6 +67,24 @@ type Options struct {
 	// GatewayZoneHMACKey signs the route+host-bound gateway context into
 	// X-Gateway-Zone-Sig. Keep it limited to Sluice and the context consumer.
 	GatewayZoneHMACKey string
+	// GatewayAuthzHMACKey signs allowed permission context independently from
+	// legacy identity and gateway-zone assertions.
+	GatewayAuthzHMACKey string
+	// GatewayAuthzContextV2Keys enables the 17-header v2 dual-write. The
+	// immutable keyring contains one current minting key and an optional previous
+	// verification key used during rotation.
+	GatewayAuthzContextV2Keys auth.AuthorizationContextV2Keyring
+	// TrustedMFAEnabled upgrades SSO requests with a per-request, Keystone-backed
+	// assertion. AssuranceLookup is deliberately independent from the browser
+	// OIDC client and MFAAssertionHMACKey is independent from every other gateway
+	// signing key. A configured feature with a missing collaborator fails closed
+	// only on SSO routes.
+	TrustedMFAEnabled   bool
+	AssuranceLookup     oidc.AssuranceLookup
+	MFAAssertionHMACKey string
+	// Now is an injectable minting clock used by deterministic tests.
+	Now func() time.Time
+	Log *slog.Logger
 	// GatewayZone is injected into X-Gateway-Zone on every forwarded request.
 	// Empty defaults to external.
 	GatewayZone string
@@ -97,6 +118,7 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 	default:
 		gatewayZone = config.DefaultGatewayZone
 	}
+	opts.GatewayZone = gatewayZone
 	if opts.PublicOnly {
 		// Public gateway: drop internal (require_group) routes so the router never
 		// matches them (they 404) — the mgmt consoles live only on the internal
@@ -107,6 +129,9 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 			// Non-internal routes are always public. A require_group route is normally
 			// dropped (404) here, UNLESS its host is allow-listed (e.g. the VPN enrollment
 			// bootstrap surface) — its gate still runs downstream in authWrap.
+			if r.InternalOnly {
+				continue
+			}
 			if r.RequireGroup == "" || opts.PublicOnlyAllowHosts[r.Match.Host] {
 				kept = append(kept, r)
 			}
@@ -121,7 +146,7 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 		handlers:   make(map[string]routeHandler),
 	}
 	for _, route := range routes {
-		proxy := newReverseProxy(route, opts.Transport, opts.GatewayHMACKey, opts.GatewayZoneHMACKey, gatewayZone, opts.SessionCookieName)
+		proxy := newReverseProxy(route, opts.Transport, opts.GatewayHMACKey, opts.GatewayZoneHMACKey, opts.GatewayAuthzHMACKey, opts.GatewayAuthzContextV2Keys, gatewayZone, opts.SessionCookieName)
 		// Auth wraps the proxy; the WAF (when enabled AND this route opted in)
 		// wraps the auth handler so malicious traffic is rejected before auth runs.
 		// opts.WAF is nil when WAF_ENABLED is off, and Middleware is a pass-through
@@ -158,21 +183,12 @@ func authWrap(route config.Route, proxy http.Handler, opts Options) http.Handler
 				http.Error(w, "sso auth not configured", http.StatusServiceUnavailable)
 			})
 		}
-		// Optional RBAC: an sso route that names a required group is wrapped with
-		// the Verdict-backed gate, which runs AFTER the SSO middleware establishes
-		// identity. When the authorizer is disabled/unconfigured or the route names
-		// no group, inner stays the bare proxy (byte-identical behavior).
-		inner := proxy
-		if opts.Authz.Enabled() {
-			if route.RequireGroup != "" {
-				// Gate: fail-closed membership check (also injects id.Groups).
-				inner = opts.Authz.Gate(route.RequireGroup, proxy)
-			} else {
-				// Plain SSO route: inject the user's groups (fail-open) so the backend can
-				// run its OWN group-based authorization (e.g. moderator-only actions).
-				inner = opts.Authz.InjectOnly(proxy)
-			}
-		}
+		// RBAC runs AFTER the SSO middleware establishes identity. Declaring a
+		// required group is an enforceable policy and therefore cannot degrade to
+		// plain SSO when Verdict is unconfigured. Ungated routes retain advisory,
+		// fail-open group decoration for backward compatibility.
+		inner := rbacWrap(route, proxy, opts)
+		inner = trustedMFAWrap(route, inner, opts)
 		return opts.Provider.Middleware(inner)
 	case config.AuthSSOOptional:
 		if opts.Provider == nil {
@@ -194,6 +210,44 @@ func authWrap(route config.Route, proxy http.Handler, opts Options) http.Handler
 	}
 }
 
+func rbacWrap(route config.Route, proxy http.Handler, opts Options) http.Handler {
+	authorizer := opts.Authz
+	inner := proxy
+	if route.RequirePermission != "" {
+		if !authorizer.Enabled() || (opts.GatewayAuthzHMACKey == "" && !opts.GatewayAuthzContextV2Keys.Enabled()) {
+			return authorizationUnavailable("permission authorization not configured")
+		}
+		inner = authorizer.PermissionGate(
+			route.RequirePermission,
+			route.PermissionResource,
+			route.Risk,
+			opts.GatewayZone,
+			inner,
+		)
+	}
+	if route.RequireGroup != "" {
+		if !authorizer.Enabled() {
+			return authorizationUnavailable("group authorization not configured")
+		}
+		return authorizer.Gate(route.RequireGroup, inner)
+	}
+	if route.RequirePermission != "" {
+		return inner
+	}
+	if authorizer.Enabled() {
+		return authorizer.InjectOnly(inner)
+	}
+	return inner
+}
+
+func authorizationUnavailable(message string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, message, http.StatusServiceUnavailable)
+	})
+}
+
 // Handler returns the top-level http.Handler with baseline security headers (outermost, so
 // they apply to every response incl. error/redirect paths) and access logging applied.
 func (s *Server) Handler() http.Handler {
@@ -212,6 +266,19 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	// intercepted before route matching so the catch-all "/" route never proxies
 	// them to Keystone.
 	if s.provider != nil && strings.HasPrefix(r.URL.Path, oidc.GatewayPrefix) {
+		if r.URL.Path == oidc.StepUpPath {
+			route, ok := s.router.StepUpRoute(r.Host)
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			ctx := oidc.ContextWithStepUpContinuation(r.Context(), oidc.StepUpContinuation{
+				Route:      route.Name,
+				Host:       route.Match.Host,
+				PathPrefix: route.StepUpResumePath,
+			})
+			r = r.WithContext(ctx)
+		}
 		s.provider.ServeHTTP(w, r)
 		return
 	}

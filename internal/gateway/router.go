@@ -60,3 +60,21 @@ func (r *Router) Match(host, path string) (config.Route, bool) {
 	}
 	return best, found
 }
+
+// StepUpRoute resolves the single exact-host route that owns a server-side step-up
+// continuation. Host-agnostic fallbacks are never eligible and duplicate owners fail closed.
+func (r *Router) StepUpRoute(host string) (config.Route, bool) {
+	var match config.Route
+	found := false
+	for _, route := range r.store.Routes() {
+		if route.Match.Host != host || route.StepUpResumePath == "" {
+			continue
+		}
+		if found {
+			return config.Route{}, false
+		}
+		match = route
+		found = true
+	}
+	return match, found
+}

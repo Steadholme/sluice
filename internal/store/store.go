@@ -16,6 +16,13 @@ type RouteStore interface {
 	Routes() []config.Route
 }
 
+// RouteChangeNotifier is implemented by live stores that can signal a freshly
+// published generation. Reloadable handlers use it instead of a second polling
+// timer, so one successful store poll produces one same-cycle handler swap.
+type RouteChangeNotifier interface {
+	RouteChanges() <-chan uint64
+}
+
 // StaticStore is an immutable, in-memory RouteStore built once from config.
 type StaticStore struct {
 	routes []config.Route

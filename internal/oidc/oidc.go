@@ -28,7 +28,9 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,6 +38,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
 
@@ -46,11 +50,13 @@ import (
 
 // Gateway-owned paths (served by Sluice, never proxied) and the session cookie.
 const (
-	GatewayPrefix = "/_gw/"
-	CallbackPath  = "/_gw/auth/callback"
-	LogoutPath    = "/_gw/auth/logout"
-	LangPath      = "/_gw/lang"
-	ThemePath     = "/_gw/theme"
+	GatewayPrefix         = "/_gw/"
+	CallbackPath          = "/_gw/auth/callback"
+	LogoutPath            = "/_gw/auth/logout"
+	LangPath              = "/_gw/lang"
+	ThemePath             = "/_gw/theme"
+	StepUpPath            = "/_gw/auth/step-up"
+	SessionRevocationPath = "/_gw/internal/v1/sessions/revoke"
 
 	// DefaultCookieName uses the __Secure- prefix (NOT __Host-): __Secure- still
 	// REQUIRES Secure + HTTPS but — unlike __Host- — PERMITS a Domain attribute, so
@@ -82,15 +88,16 @@ const (
 // are PUBLIC (browser-facing); TokenURL is INTERNAL (server-to-server, optionally
 // mTLS). SessionSecret signs the opaque cookie id.
 type Config struct {
-	Issuer        string        // PUBLIC issuer; also the id_token `iss` and the authorize-endpoint base
-	TokenURL      string        // INTERNAL token endpoint (e.g. https://keystone:8443/token)
-	ClientID      string        // gateway client_id (= expected id_token `aud`)
-	ClientSecret  string        // client_secret_post credential
-	RedirectURI   string        // PUBLIC redirect_uri (= CallbackPath on the public host)
-	SessionTTL    time.Duration // gateway session lifetime
-	SessionSecret string        // HMAC key for the signed cookie id
-	CookieName    string        // defaults to DefaultCookieName
-	CookieDomain  string        // Domain attribute for the session cookie (e.g. .w33d.xyz); empty = host-only
+	Issuer                 string        // PUBLIC issuer; also the id_token `iss` and the authorize-endpoint base
+	TokenURL               string        // INTERNAL token endpoint (e.g. https://keystone:8443/token)
+	ClientID               string        // gateway client_id (= expected id_token `aud`)
+	ClientSecret           string        // client_secret_post credential
+	RedirectURI            string        // PUBLIC redirect_uri (= CallbackPath on the public host)
+	SessionTTL             time.Duration // gateway session lifetime
+	SessionSecret          string        // HMAC key for the signed cookie id
+	SessionRevocationToken string        // bearer token enabling subject-wide JML revocation; empty disables the endpoint
+	CookieName             string        // defaults to DefaultCookieName
+	CookieDomain           string        // Domain attribute for the session cookie (e.g. .w33d.xyz); empty = host-only
 
 	// Auditor is the non-blocking audit emitter. When nil, the relying party
 	// emits no audit events (and behaves exactly as before).
@@ -205,9 +212,130 @@ func (p *Provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleLang(w, r)
 	case ThemePath:
 		p.handleTheme(w, r)
+	case StepUpPath:
+		p.handleStepUp(w, r)
+	case SessionRevocationPath:
+		p.handleSessionRevocation(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+type sessionRevocationRequest struct {
+	Subject       string              `json:"subject"`
+	State         SubjectSessionState `json:"state"`
+	SourceEventID string              `json:"source_event_id"`
+	SourceVersion int64               `json:"source_version"`
+	CorrelationID string              `json:"correlation_id,omitempty"`
+}
+
+// handleSessionRevocation is an internal service-to-service JML endpoint. It is
+// deliberately absent when no dedicated token is configured, and it revokes by
+// the exact Keystone subject stored in the shared Sluice session database.
+func (p *Provider) handleSessionRevocation(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if p.cfg.SessionRevocationToken == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !validServiceBearer(r.Header.Get("Authorization"), p.cfg.SessionRevocationToken) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="sluice-jml"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var input sessionRevocationRequest
+	if err := decoder.Decode(&input); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if !validSubject(input.Subject) || !input.State.Valid() ||
+		!validOpaqueIdentifier(input.SourceEventID, 256, false) || input.SourceVersion <= 0 ||
+		!validCorrelationID(input.CorrelationID) {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	result, err := p.sessions.ApplySubjectSessionState(r.Context(), SubjectSessionStatus{
+		Subject:       input.Subject,
+		State:         input.State,
+		SourceEventID: input.SourceEventID,
+		SourceVersion: input.SourceVersion,
+	})
+	if err != nil {
+		if errors.Is(err, ErrSubjectSessionStateConflict) || errors.Is(err, ErrSubjectSessionStateStale) {
+			http.Error(w, "subject session state conflict", http.StatusConflict)
+			return
+		}
+		p.log.Error("oidc: revoke sessions by subject", "error", err)
+		http.Error(w, "session revocation temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	p.audit.Emit(audit.Event{
+		Actor:    "service:access-governance",
+		Action:   audit.ActionSSORevokeSubject,
+		Target:   input.Subject,
+		Severity: audit.SeverityInfo,
+		Detail: fmt.Sprintf(
+			"state=%s source_version=%d revoked=%d replayed=%t correlation_id=%s",
+			input.State,
+			input.SourceVersion,
+			result.Revoked,
+			result.Replayed,
+			input.CorrelationID,
+		),
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"subject":          input.Subject,
+		"state":            input.State,
+		"source_event_id":  input.SourceEventID,
+		"source_version":   input.SourceVersion,
+		"correlation_id":   input.CorrelationID,
+		"revoked":          result.Revoked,
+		"revoked_sessions": result.Revoked,
+		"replayed":         result.Replayed,
+	})
+}
+
+func validServiceBearer(header, expected string) bool {
+	const prefix = "Bearer "
+	if expected == "" || !strings.HasPrefix(header, prefix) {
+		return false
+	}
+	token := strings.TrimPrefix(header, prefix)
+	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
+}
+
+func validSubject(subject string) bool {
+	return validOpaqueIdentifier(subject, 256, false)
+}
+
+func validCorrelationID(correlationID string) bool {
+	return validOpaqueIdentifier(correlationID, 128, true)
+}
+
+func validOpaqueIdentifier(value string, maxBytes int, allowEmpty bool) bool {
+	if value == "" {
+		return allowEmpty
+	}
+	if len(value) > maxBytes || !utf8.ValidString(value) || value != strings.TrimSpace(value) {
+		return false
+	}
+	return strings.IndexFunc(value, unicode.IsControl) == -1
 }
 
 // Middleware gates an sso route. A valid gateway session injects the verified
@@ -215,9 +343,17 @@ func (p *Provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // and proxies; otherwise the browser is sent through Keystone login.
 func (p *Provider) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if id, ok := p.sessionIdentity(r); ok {
+		id, session, ok, err := p.sessionIdentity(r)
+		if err != nil {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "session authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if ok {
 			accesslog.SetSubject(r.Context(), id.Subject)
 			ctx := auth.ContextWithIdentity(r.Context(), id)
+			ctx = ContextWithGatewaySession(ctx, session)
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
@@ -232,9 +368,17 @@ func (p *Provider) Middleware(next http.Handler) http.Handler {
 // so anonymous requests reach the upstream with no identity.
 func (p *Provider) OptionalMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if id, ok := p.sessionIdentity(r); ok {
+		id, session, ok, err := p.sessionIdentity(r)
+		if err != nil {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "session authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if ok {
 			accesslog.SetSubject(r.Context(), id.Subject)
 			ctx := auth.ContextWithIdentity(r.Context(), id)
+			ctx = ContextWithGatewaySession(ctx, session)
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
@@ -243,26 +387,26 @@ func (p *Provider) OptionalMiddleware(next http.Handler) http.Handler {
 }
 
 // sessionIdentity resolves the __Secure-gw cookie to a live session identity. Any
-// failure (no cookie, bad signature, unknown/expired session) returns ok=false
-// so the caller starts a fresh login.
-func (p *Provider) sessionIdentity(r *http.Request) (*auth.Identity, bool) {
+// failure (no cookie, bad signature, unknown/expired session) returns ok=false so the caller
+// starts a fresh login. A store failure is distinct authority uncertainty and must be 503.
+func (p *Provider) sessionIdentity(r *http.Request) (*auth.Identity, Session, bool, error) {
 	c, err := r.Cookie(p.cfg.CookieName)
 	if err != nil {
-		return nil, false
+		return nil, Session{}, false, nil
 	}
 	id, ok := p.signer.verify(c.Value)
 	if !ok {
-		return nil, false
+		return nil, Session{}, false, nil
 	}
 	sess, ok, err := p.sessions.GetSession(r.Context(), id)
 	if err != nil {
 		p.log.Warn("oidc: session lookup failed", "error", err)
-		return nil, false
+		return nil, Session{}, false, err
 	}
 	if !ok {
-		return nil, false
+		return nil, Session{}, false, nil
 	}
-	return &auth.Identity{Subject: sess.Sub, Email: sess.Email, Scope: sess.Scope}, true
+	return &auth.Identity{Subject: sess.Sub, Email: sess.Email, Scope: sess.Scope}, sess, true, nil
 }
 
 // beginAuth starts an authorization-code + PKCE flow: it persists fresh
@@ -278,6 +422,7 @@ func (p *Provider) beginAuth(w http.ResponseWriter, r *http.Request) {
 		CodeVerifier: verifier,
 		OriginalURL:  originalURL(r),
 		ExpiresAt:    p.now().Add(stateTTL).Unix(),
+		Flow:         OAuthFlowLogin,
 	}
 	if err := p.states.PutState(r.Context(), st); err != nil {
 		p.log.Error("oidc: persist oauth state", "error", err)
@@ -301,18 +446,13 @@ func (p *Provider) beginAuth(w http.ResponseWriter, r *http.Request) {
 // the id_token, mint a session, set __Secure-gw, and return to the original URL.
 func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
-	if e := qs.Get("error"); e != "" {
-		p.auditDeny("authorization error")
-		http.Error(w, "authorization failed: "+sanitize(e), http.StatusUnauthorized)
+	stateValues, hasState := qs["state"]
+	if !hasState || len(stateValues) != 1 || stateValues[0] == "" {
+		p.auditDeny("missing state")
+		http.Error(w, "missing state", http.StatusBadRequest)
 		return
 	}
-	state := qs.Get("state")
-	code := qs.Get("code")
-	if state == "" || code == "" {
-		p.auditDeny("missing state or code")
-		http.Error(w, "missing state or code", http.StatusBadRequest)
-		return
-	}
+	state := stateValues[0]
 	st, ok, err := p.states.TakeState(r.Context(), state)
 	if err != nil {
 		p.log.Error("oidc: take oauth state", "error", err)
@@ -324,6 +464,57 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		p.auditDeny("invalid state")
 		http.Error(w, "invalid or expired authorization state", http.StatusBadRequest)
 		return
+	}
+	if st.Flow == "" {
+		st.Flow = OAuthFlowLogin
+	}
+	if st.Flow != OAuthFlowLogin && st.Flow != OAuthFlowStepUp {
+		p.auditDeny("invalid authorization flow")
+		http.Error(w, "invalid authorization flow", http.StatusBadRequest)
+		return
+	}
+	if st.Flow == OAuthFlowStepUp && !validStepUpOAuthState(st) {
+		p.auditDeny("invalid step-up state")
+		http.Error(w, "invalid step-up state", http.StatusBadRequest)
+		return
+	}
+	if errorValues, hasError := qs["error"]; hasError {
+		if len(errorValues) != 1 || errorValues[0] == "" {
+			p.auditDeny("invalid authorization error")
+			http.Error(w, "invalid authorization error", http.StatusBadRequest)
+			return
+		}
+		e := errorValues[0]
+		p.auditDeny("authorization error")
+		if st.Flow == OAuthFlowStepUp {
+			http.Redirect(w, r, st.OriginalURL, http.StatusSeeOther)
+			return
+		}
+		http.Error(w, "authorization failed: "+sanitize(e), http.StatusUnauthorized)
+		return
+	}
+	codeValues, hasCode := qs["code"]
+	if !hasCode || len(codeValues) != 1 || codeValues[0] == "" {
+		p.auditDeny("missing code")
+		http.Error(w, "missing code", http.StatusBadRequest)
+		return
+	}
+	code := codeValues[0]
+
+	var previous Session
+	if st.Flow == OAuthFlowStepUp {
+		previous, err = p.stepUpSourceSession(r, st)
+		if err != nil {
+			if !errors.Is(err, ErrSessionReplacementConflict) {
+				p.log.Error("oidc: read step-up source session", "error", err)
+				w.Header().Set("Retry-After", "5")
+				http.Error(w, "session authority unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			p.auditDeny("step-up source session changed")
+			http.Error(w, "step-up source session changed", http.StatusConflict)
+			return
+		}
 	}
 
 	tok, err := p.exchangeCode(r.Context(), code, st.CodeVerifier)
@@ -348,16 +539,64 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	now := p.now().Unix()
 	id := p.token()
-	sess := Session{
-		ID:        id,
-		Sub:       claims.Subject,
-		Email:     claims.Email,
-		Scope:     scope,
-		CreatedAt: now,
-		ExpiresAt: now + int64(p.cfg.SessionTTL.Seconds()),
+	assurance, err := assuranceFromIDTokenClaims(claims)
+	if err != nil {
+		p.log.Warn("oidc: invalid id_token assurance", "error", err)
+		p.auditDeny("invalid id_token assurance")
+		http.Error(w, "invalid id_token", http.StatusBadGateway)
+		return
 	}
-	if err := p.sessions.CreateSession(r.Context(), sess); err != nil {
-		p.log.Error("oidc: create session", "error", err)
+	if st.Flow == OAuthFlowStepUp {
+		if claims.Subject != st.ExpectedSub || !freshStrongAssurance(assurance, now) {
+			p.auditDeny("step-up assurance mismatch")
+			http.Error(w, "strong authentication was not satisfied", http.StatusForbidden)
+			return
+		}
+	}
+	expiresAt := now + int64(p.cfg.SessionTTL.Seconds())
+	if st.Flow == OAuthFlowStepUp && previous.ExpiresAt < expiresAt {
+		expiresAt = previous.ExpiresAt
+	}
+	sess := Session{
+		ID:             id,
+		Sub:            claims.Subject,
+		Email:          claims.Email,
+		Scope:          scope,
+		CreatedAt:      now,
+		ExpiresAt:      expiresAt,
+		SessionBinding: assurance.SessionBinding,
+		AAL:            assurance.AAL,
+		UV:             assurance.UV,
+		AuthTime:       assurance.AuthTime,
+		FactorEpoch:    assurance.FactorEpoch,
+	}
+	if st.Flow == OAuthFlowStepUp {
+		err = p.sessions.ReplaceSession(
+			r.Context(),
+			st.PreviousSessionID,
+			st.PreviousSessionBinding,
+			sess,
+		)
+	} else {
+		err = p.sessions.CreateSession(r.Context(), sess)
+	}
+	if err != nil {
+		if errors.Is(err, ErrSubjectSessionBlocked) {
+			p.auditDeny("subject session blocked")
+			http.Error(w, "account is not active", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, ErrSessionReplacementAssurance) {
+			p.auditDeny("step-up assurance expired during session replacement")
+			http.Error(w, "strong authentication was not satisfied", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, ErrSessionReplacementConflict) {
+			p.auditDeny("step-up source session changed")
+			http.Error(w, "step-up source session changed", http.StatusConflict)
+			return
+		}
+		p.log.Error("oidc: create or replace session", "error", err)
 		http.Error(w, "auth temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -367,7 +606,15 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		Target:   p.cfg.ClientID,
 		Severity: audit.SeverityInfo,
 	})
-	p.setCookie(w, p.signer.sign(id), int(p.cfg.SessionTTL.Seconds()))
+	cookieTTL := int(p.cfg.SessionTTL.Seconds())
+	if st.Flow == OAuthFlowStepUp {
+		cookieTTL = int(expiresAt - now)
+	}
+	p.setCookie(w, p.signer.sign(id), cookieTTL)
+	if st.Flow == OAuthFlowStepUp {
+		http.Redirect(w, r, st.OriginalURL, http.StatusSeeOther)
+		return
+	}
 	http.Redirect(w, r, p.safeReturn(st.OriginalURL), http.StatusFound)
 }
 
@@ -605,9 +852,73 @@ type tokenResponse struct {
 // idTokenClaims is the subset of id_token claims validated/consumed. iss/aud/exp
 // are enforced by the parser; email/nonce are application claims.
 type idTokenClaims struct {
-	Email string `json:"email"`
-	Nonce string `json:"nonce"`
+	Email    string            `json:"email"`
+	Nonce    string            `json:"nonce"`
+	AuthTime *int64            `json:"auth_time,omitempty"`
+	ACR      *string           `json:"acr,omitempty"`
+	AMR      *[]string         `json:"amr,omitempty"`
+	MFA      *idTokenMFAClaims `json:"hf_mfa,omitempty"`
 	jwt.RegisteredClaims
+}
+
+type idTokenMFAClaims struct {
+	AAL string `json:"aal"`
+	UV  bool   `json:"uv"`
+	SB  string `json:"sb"`
+	FE  int64  `json:"fe"`
+}
+
+type idTokenAssurance struct {
+	SessionBinding string
+	AAL            string
+	UV             bool
+	AuthTime       int64
+	FactorEpoch    int64
+}
+
+func assuranceFromIDTokenClaims(claims *idTokenClaims) (idTokenAssurance, error) {
+	legacy := claims.AuthTime == nil && claims.ACR == nil && claims.AMR == nil && claims.MFA == nil
+	if legacy {
+		return idTokenAssurance{AAL: SessionAALNone}, nil
+	}
+	if claims.AuthTime == nil || claims.ACR == nil || claims.AMR == nil || claims.MFA == nil {
+		return idTokenAssurance{}, fmt.Errorf("partial assurance claims")
+	}
+	switch claims.MFA.AAL {
+	case SessionAALNone:
+		if *claims.AuthTime != 0 || *claims.ACR != "hf-aal-none" || len(*claims.AMR) != 0 ||
+			claims.MFA.UV || claims.MFA.SB != "" || claims.MFA.FE != 0 {
+			return idTokenAssurance{}, fmt.Errorf("non-canonical AAL_NONE claims")
+		}
+		return idTokenAssurance{AAL: SessionAALNone}, nil
+	case SessionMFAStrong:
+		if *claims.AuthTime <= 0 || *claims.ACR != "hf-aal-strong" || !claims.MFA.UV ||
+			claims.MFA.FE < 0 || !validLowerHex64(claims.MFA.SB) || !validStrongAMR(*claims.AMR) {
+			return idTokenAssurance{}, fmt.Errorf("invalid MFA_STRONG claims")
+		}
+		return idTokenAssurance{
+			SessionBinding: claims.MFA.SB,
+			AAL:            SessionMFAStrong,
+			UV:             true,
+			AuthTime:       *claims.AuthTime,
+			FactorEpoch:    claims.MFA.FE,
+		}, nil
+	default:
+		return idTokenAssurance{}, fmt.Errorf("unknown assurance level")
+	}
+}
+
+func validStrongAMR(amr []string) bool {
+	return len(amr) == 2 &&
+		((amr[0] == "pwd" && amr[1] == "otp") || (amr[0] == "hwk" && amr[1] == "user"))
+}
+
+func validLowerHex64(value string) bool {
+	if len(value) != 64 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // signer signs/verifies an opaque cookie value with HMAC-SHA256: "value.sig".
@@ -675,15 +986,19 @@ func originalURL(r *http.Request) string {
 // A same-origin relative path is always safe. An empty/odd target falls back to
 // root.
 func (p *Provider) safeReturn(target string) string {
-	if target == "" {
+	if target == "" || strings.Contains(target, "\\") || strings.IndexFunc(target, unicode.IsControl) >= 0 {
 		return "/"
 	}
 	// Same-origin relative path ("/...", but not the protocol-relative "//host").
 	if strings.HasPrefix(target, "/") && !strings.HasPrefix(target, "//") {
-		return target
+		u, err := url.ParseRequestURI(target)
+		if err == nil && !u.IsAbs() && u.Host == "" {
+			return target
+		}
+		return "/"
 	}
 	u, err := url.Parse(target)
-	if err != nil {
+	if err != nil || u.User != nil {
 		return "/"
 	}
 	if u.Scheme == "https" && u.Host != "" && p.hostInCookieDomain(u.Hostname()) {
@@ -692,7 +1007,7 @@ func (p *Provider) safeReturn(target string) string {
 	// Not a trusted absolute target: keep only the (safe) path+query so we never
 	// emit an open redirect to a foreign origin.
 	rel := u.EscapedPath()
-	if rel == "" {
+	if rel == "" || !strings.HasPrefix(rel, "/") || strings.Contains(rel, "\\") {
 		return "/"
 	}
 	if u.RawQuery != "" {
