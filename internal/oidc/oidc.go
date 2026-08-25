@@ -269,6 +269,8 @@ func (p *Provider) sessionIdentity(r *http.Request) (*auth.Identity, bool) {
 // state/nonce/verifier + the original URL, then 302s the browser to Keystone's
 // PUBLIC authorize endpoint.
 func (p *Provider) beginAuth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
+
 	state := p.token()
 	nonce := p.token()
 	verifier := p.token()

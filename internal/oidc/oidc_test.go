@@ -284,6 +284,7 @@ func TestBeginAuthRedirectParams(t *testing.T) {
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("status = %d, want 302", resp.StatusCode)
 	}
+	assertPrivateNoStore(t, resp.Header)
 	loc, err := url.Parse(resp.Header.Get("Location"))
 	if err != nil {
 		t.Fatalf("parse Location: %v", err)
@@ -308,6 +309,44 @@ func TestBeginAuthRedirectParams(t *testing.T) {
 		if q.Get(k) == "" {
 			t.Errorf("authorize missing %s", k)
 		}
+	}
+}
+
+func TestBeginAuthPersistenceFailureNoStore(t *testing.T) {
+	fi := newFakeIssuer(t)
+	p := newTestProvider(t, fi)
+	p.states = failingStateStore{}
+
+	req := httptest.NewRequest(http.MethodGet, "https://analyze.w33d.xyz/app/secret", nil)
+	rec := httptest.NewRecorder()
+	p.beginAuth(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	assertPrivateNoStore(t, resp.Header)
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Fatalf("unexpected redirect Location = %q", loc)
+	}
+}
+
+type failingStateStore struct{}
+
+func (failingStateStore) PutState(context.Context, OAuthState) error {
+	return context.Canceled
+}
+
+func (failingStateStore) TakeState(context.Context, string) (OAuthState, bool, error) {
+	return OAuthState{}, false, context.Canceled
+}
+
+func assertPrivateNoStore(t *testing.T, h http.Header) {
+	t.Helper()
+	values := h.Values("Cache-Control")
+	if len(values) != 1 || values[0] != "private, no-store" {
+		t.Fatalf("Cache-Control = %q, want exactly [private, no-store]", values)
 	}
 }
 
