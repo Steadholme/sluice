@@ -160,6 +160,9 @@ func TestStepUpInterstitialIsTruthfulNoScriptSingleSubmit(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("GET status = %d, body=%s", recorder.Code, recorder.Body.String())
 	}
+	if got := recorder.Header().Get("Referrer-Policy"); got != "strict-origin-when-cross-origin" {
+		t.Fatalf("Referrer-Policy = %q, want strict-origin-when-cross-origin", got)
+	}
 	body := recorder.Body.String()
 
 	// Truthful copy: the exact action is saved and has not executed.
@@ -210,6 +213,53 @@ func TestStepUpInterstitialIsTruthfulNoScriptSingleSubmit(t *testing.T) {
 	}
 	if strings.Contains(body, "return_to") {
 		t.Fatal("interstitial must not contain any return_to field or parameter")
+	}
+}
+
+func TestStepUpPOSTRejectsMissingNullAndCrossOriginBeforeCreatingState(t *testing.T) {
+	fi := newFakeIssuer(t)
+	p := newTestProvider(t, fi)
+	p.now = func() time.Time { return time.Unix(1_754_400_123, 0) }
+	sessions := p.sessions.(*MemoryStore)
+	states := p.states.(*MemoryStore)
+	sessions.now = func() int64 { return p.now().Unix() }
+	states.now = func() int64 { return p.now().Unix() }
+	session := stepUpTestSession()
+	if err := sessions.CreateSession(context.Background(), session); err != nil {
+		t.Fatal(err)
+	}
+	continuation := StepUpContinuation{
+		Route: "access-root", Host: "access.example", PathPrefix: "/request/scope/step-up/",
+	}
+	csrf := p.mintStepUpCSRF(session, continuation, testStepUpRef, p.now().Unix()+60)
+
+	for _, test := range []struct {
+		name   string
+		origin string
+	}{
+		{name: "missing"},
+		{name: "null", origin: "null"},
+		{name: "cross origin", origin: "https://other.example"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			form := url.Values{"ref": {testStepUpRef}, "csrf_token": {csrf}}
+			request := stepUpRequest(p, http.MethodPost, strings.NewReader(form.Encode()), continuation)
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if test.origin != "" {
+				request.Header.Set("Origin", test.origin)
+			}
+			recorder := httptest.NewRecorder()
+			p.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusForbidden || recorder.Body.String() != "invalid step-up origin\n" {
+				t.Fatalf("response = %d %q, want origin rejection", recorder.Code, recorder.Body.String())
+			}
+			states.mu.Lock()
+			stateCount := len(states.states)
+			states.mu.Unlock()
+			if stateCount != 0 {
+				t.Fatalf("invalid Origin created %d OAuth states", stateCount)
+			}
+		})
 	}
 }
 

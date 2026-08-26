@@ -106,7 +106,9 @@ func exactStepUpRef(r *http.Request) (string, bool) {
 
 func (p *Provider) handleStepUp(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, no-store")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	// Preserve the same-origin POST's exact Origin while withholding the step-up path and
+	// reference from cross-origin referrers.
+	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	continuation, ok := stepUpContinuationFromContext(r.Context())
 	if !ok || continuation.Host != r.Host {
 		http.NotFound(w, r)
