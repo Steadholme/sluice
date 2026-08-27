@@ -42,6 +42,8 @@ func TestRedactPathCapabilityNamespaces(t *testing.T) {
 		{name: "same path wrong host", host: "forum.w33d.xyz", path: "/review/" + token, want: "/review/[capability]"},
 		{name: "public asset", host: "drive.w33d.xyz", path: "/s/share-room.css", want: "/s/share-room.css"},
 		{name: "public script", host: "drive.w33d.xyz", path: "/s/share-room.js", want: "/s/share-room.js"},
+		{name: "versioned public asset", host: "drive.w33d.xyz", path: "/s/share-room-20260821.css", want: "/s/share-room-20260821.css"},
+		{name: "versioned public script", host: "drive.w33d.xyz", path: "/s/share-room-20260821.js", want: "/s/share-room-20260821.js"},
 		{name: "empty suffix", host: "drive.w33d.xyz", path: "/u/", want: "/u/"},
 		{name: "invalid segment", host: "blog.w33d.xyz", path: "/review/" + strings.Repeat("a", 24) + ".html", want: "/review/[capability]"},
 	}

@@ -56,12 +56,13 @@ func SetSubject(ctx context.Context, subject string) {
 // the path rather than Host or token validity: malformed requests, a trailing-dot Host and a token
 // sent to the wrong virtual host must be just as unable to disclose a secret as a valid request.
 // Query strings are already excluded from the access log. The only non-secret names beneath /s/
-// are the two fixed Share Room assets; every other /s/ tail is capability-bearing, including the
+// are the fixed Share Room assets; every other /s/ tail is capability-bearing, including the
 // nested /s/folder/{token} route. Every non-empty /rsvp/ tail is capability-bearing as well,
 // regardless of whether it is a valid token or request route.
 func RedactPath(_ string, path string) string {
 	switch {
-	case path == "/s/share-room.css", path == "/s/share-room.js":
+	case path == "/s/share-room.css", path == "/s/share-room.js",
+		path == "/s/share-room-20260821.css", path == "/s/share-room-20260821.js":
 		return path
 	case len(path) > len("/s/folder/") && path[:len("/s/folder/")] == "/s/folder/":
 		return "/s/folder/[capability]"

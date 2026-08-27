@@ -149,7 +149,12 @@ func TestSecureHeadersAppliesRSVPPrivacyBeforeFlush(t *testing.T) {
 
 func TestSecureHeadersPreservesShareRoomAssetCache(t *testing.T) {
 	t.Parallel()
-	for _, path := range []string{"/s/share-room.css", "/s/share-room.js"} {
+	for _, path := range []string{
+		"/s/share-room.css",
+		"/s/share-room.js",
+		"/s/share-room-20260821.css",
+		"/s/share-room-20260821.js",
+	} {
 		path := path
 		t.Run(path, func(t *testing.T) {
 			t.Parallel()

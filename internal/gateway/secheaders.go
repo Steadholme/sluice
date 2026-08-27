@@ -48,7 +48,7 @@ type secHeaderWriter struct {
 // Capability authority is carried in the path. Enforce no-referrer and no-store at the outer
 // gateway layer so router misses, method errors and reverse-proxy failures receive the same privacy
 // policy as a successful product response. Path-based matching is intentionally fail-safe across
-// Host and token validity, matching access-log redaction. The two fixed Share Room assets keep
+// Host and token validity, matching access-log redaction. The fixed Share Room assets keep
 // their product-provided public cache policy but still receive no-referrer.
 func isCapabilityNamespace(path string) bool {
 	if isRSVPCapabilityPath(path) {
@@ -67,7 +67,9 @@ func isRSVPCapabilityPath(path string) bool {
 }
 
 func isCapabilityAuthorityPath(path string) bool {
-	if path == "/s/share-room.css" || path == "/s/share-room.js" {
+	switch path {
+	case "/s/share-room.css", "/s/share-room.js",
+		"/s/share-room-20260821.css", "/s/share-room-20260821.js":
 		return false
 	}
 	return isCapabilityNamespace(path)
