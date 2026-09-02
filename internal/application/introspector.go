@@ -225,16 +225,12 @@ func validScopeString(scope string) bool {
 }
 
 func validScope(value string) bool {
-	if value == "" || len(value) > 128 {
+	switch value {
+	case "analysis.create", "analysis.read", "analysis.conversation", "analysis.upload.cancel":
+		return true
+	default:
 		return false
 	}
-	for i := range len(value) {
-		b := value[i]
-		if !((b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '.' || b == ':' || b == '_' || b == '-') {
-			return false
-		}
-	}
-	return true
 }
 
 func validOpaqueID(value string) bool {

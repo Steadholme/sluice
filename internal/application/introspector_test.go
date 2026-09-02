@@ -17,13 +17,37 @@ import (
 
 const testApplicationToken = "app_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
+func TestApplicationScopesUseOnlyPublicAnalyzeSurface(t *testing.T) {
+	for _, scope := range []string{
+		"analysis.create",
+		"analysis.read",
+		"analysis.conversation",
+		"analysis.upload.cancel",
+	} {
+		if !validScope(scope) {
+			t.Fatalf("public scope %q rejected", scope)
+		}
+	}
+	for _, scope := range []string{
+		"rikune.analysis.create",
+		"rikune.analysis.read",
+		"rikune.conversation.use",
+		"rikune.upload.cancel",
+		"analysis.unknown",
+	} {
+		if validScope(scope) {
+			t.Fatalf("non-public scope %q accepted", scope)
+		}
+	}
+}
+
 func TestAccessApplicationIntrospectionSharedKnownVector(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/application_introspection_active_v1.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(fixture)
-	if got := hex.EncodeToString(digest[:]); got != "6b14e68f060408b720291a55d58020a5df7f3c24ceedc2532e49f9cd404fcc28" {
+	if got := hex.EncodeToString(digest[:]); got != "2dd3cc1217b25216652ecb4f7c22d3545de9d9f7093f3c1b847c17c56f8a4915" {
 		t.Fatalf("fixture digest=%s", got)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -44,6 +68,15 @@ func TestAccessApplicationIntrospectionSharedKnownVector(t *testing.T) {
 	}
 	if !result.Active || result.Subject != "application:abcdefghijklmnop" || result.ApplicationSub != result.Subject || result.Audience != "analyze-facade" || result.Fingerprint != strings.Repeat("b", 64) || result.ClientID != "app_abcdefghijklmnop" || result.CredentialID != "acr_abcdefghijklmnop" || result.GrantID != "grt_abcdefghijklmnop" || result.CredentialState != CredentialActive || result.OverlapUntil != nil || result.PolicyEpoch != 11 || result.RevocationEpoch != 13 {
 		t.Fatalf("result=%+v", result)
+	}
+	wantScopes := []string{"analysis.conversation", "analysis.create", "analysis.read", "analysis.upload.cancel"}
+	if len(result.Scopes) != len(wantScopes) {
+		t.Fatalf("scopes=%q", result.Scopes)
+	}
+	for index := range wantScopes {
+		if result.Scopes[index] != wantScopes[index] {
+			t.Fatalf("scopes=%q", result.Scopes)
+		}
 	}
 }
 
@@ -108,6 +141,7 @@ func TestApplicationIntrospectionInactiveIsExactAndFailuresAreUnavailable(t *tes
 		`{"active":true,"sub":"application:abcdefghijklmnop","application_sub":"application:differentdifferent","scope":"analysis.read","exp":2000000000,"token_type":"Bearer","client_id":"client_abcdefghijklmnop","credential_id":"cred_abcdefghijklmnop","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","grant_id":"grant_abcdefghijklmnop","package_id":"pkg_analyze_mcp_client","package_revision_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","audience":"analyze-facade","credential_version":1,"subject_version":1,"credential_state":"active","overlap_until":null,"policy_epoch":1,"revocation_epoch":1}`,
 		`{"active":true,"active":true,"sub":"application:abcdefghijklmnop","application_sub":"application:abcdefghijklmnop","scope":"analysis.read","exp":2000000000,"token_type":"Bearer","client_id":"client_abcdefghijklmnop","credential_id":"cred_abcdefghijklmnop","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","grant_id":"grant_abcdefghijklmnop","package_id":"pkg_analyze_mcp_client","package_revision_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","audience":"analyze-facade","credential_version":1,"subject_version":1,"credential_state":"active","overlap_until":null,"policy_epoch":1,"revocation_epoch":1}`,
 		`{"active":true,"sub":"application:abcdefghijklmnop","application_sub":"application:abcdefghijklmnop","scope":"analysis.read","exp":2000000000,"token_type":"Bearer","client_id":"client_abcdefghijklmnop","credential_id":"cred_abcdefghijklmnop","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","grant_id":"grant_abcdefghijklmnop","package_id":"pkg_analyze_mcp_client","package_revision_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","audience":"analyze-facade","credential_version":1,"subject_version":1,"credential_state":"active","overlap_until":null,"policy_epoch":1,"revocation_epoch":1,"unknown":true}`,
+		`{"active":true,"sub":"application:abcdefghijklmnop","application_sub":"application:abcdefghijklmnop","scope":"rikune.analysis.read","exp":2000000000,"token_type":"Bearer","client_id":"client_abcdefghijklmnop","credential_id":"cred_abcdefghijklmnop","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","grant_id":"grant_abcdefghijklmnop","package_id":"pkg_analyze_mcp_client","package_revision_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","audience":"analyze-facade","credential_version":1,"subject_version":1,"credential_state":"active","overlap_until":null,"policy_epoch":1,"revocation_epoch":1}`,
 	}
 	for index, response := range responses {
 		t.Run(string(rune('a'+index)), func(t *testing.T) {
