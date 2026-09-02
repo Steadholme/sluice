@@ -639,7 +639,7 @@ func TestTrustedMFASponsorAssertionIssuedInPlaceAndStripsClientHeaders(t *testin
 				t.Fatal(err)
 			}
 			bodyDigest := sha256.Sum256([]byte(tc.body))
-			if assertion.RequestID != "abcdefghijklmnop" || assertion.RequestVersion != tc.version || assertion.NormalizedPath != tc.path || assertion.BodySHA256 != hex.EncodeToString(bodyDigest[:]) || assertion.SessionBinding != strings.Repeat("a", 64) || assertion.AuthTime != fixedNow.Unix()-10 || len(assertion.AMR) != 2 {
+			if assertion.Subject != "usr_abcdefghijklmnop" || assertion.RequestID != "abcdefghijklmnop" || assertion.RequestVersion != tc.version || assertion.NormalizedPath != tc.path || assertion.BodySHA256 != hex.EncodeToString(bodyDigest[:]) || assertion.SessionBinding != strings.Repeat("a", 64) || assertion.AuthTime != fixedNow.Unix()-10 || len(assertion.AMR) != 2 {
 				t.Fatalf("assertion=%+v", assertion)
 			}
 			assertExactSponsorHeaderTriplet(t, got.headers)

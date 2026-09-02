@@ -35,7 +35,7 @@ func TestAccessSponsorAssertionSharedKnownVector(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(fixtureBytes)
-	if got := hex.EncodeToString(digest[:]); got != "fa76484235621961be0ba4ee217d8941e3f0bfcddb039ccb8b68a1fb354a2e7e" {
+	if got := hex.EncodeToString(digest[:]); got != "c92ee510a4be88e511f62c72256e3ad5cd647df7d4c3ec5c74d9d39c08d010bd" {
 		t.Fatalf("fixture digest=%s", got)
 	}
 	var fixture sponsorInteropFixture
