@@ -1,0 +1,51 @@
+{
+  "header_names": [
+    "X-Sponsor-Assertion-Kid",
+    "X-Sponsor-Assertion-Assertion",
+    "X-Sponsor-Assertion-Sig"
+  ],
+  "json_submit": {
+    "content_type": "application/json",
+    "body": "{\"expected_version\":3}",
+    "claims": {
+      "v": 1,
+      "kid": "appctx-2026a",
+      "iss": "https://id.w33d.xyz",
+      "aud": "access-governance",
+      "sub": "user:owner",
+      "jti": "sponsor-json-abcdefghijklmnop",
+      "request_id": "arq_abcdefghijklmnop",
+      "request_version": 3,
+      "method": "POST",
+      "normalized_path": "/api/v1/application-requests/arq_abcdefghijklmnop/submit",
+      "body_sha256": "b2cc294f0c0bdcd3422499a968861d44fee45201266dc42f2f941a1a8bc78594",
+      "session_binding": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "auth_time": 1900000000,
+      "amr": ["passkey", "uv"],
+      "iat": 1900000010,
+      "exp": 1900000310
+    }
+  },
+  "html_submit": {
+    "content_type": "application/x-www-form-urlencoded",
+    "body": "csrf_token=csrf-value&expected_version=3",
+    "claims": {
+      "v": 1,
+      "kid": "appctx-2026a",
+      "iss": "https://id.w33d.xyz",
+      "aud": "access-governance",
+      "sub": "user:owner",
+      "jti": "sponsor-form-abcdefghijklmnop",
+      "request_id": "arq_abcdefghijklmnop",
+      "request_version": 3,
+      "method": "POST",
+      "normalized_path": "/applications/arq_abcdefghijklmnop/submit",
+      "body_sha256": "1d4b3c7d0cbc99c2e2b3b704ef788e80bd2abcae453b6eacc3ec826892026518",
+      "session_binding": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "auth_time": 1900000000,
+      "amr": ["passkey", "uv"],
+      "iat": 1900000010,
+      "exp": 1900000310
+    }
+  }
+}

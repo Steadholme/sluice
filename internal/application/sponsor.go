@@ -10,14 +10,17 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"regexp"
+	"strconv"
 	"time"
 )
 
 const (
 	HeaderSponsorKID       = "X-Sponsor-Assertion-Kid"
-	HeaderSponsorAssertion = "X-Sponsor-Assertion"
+	HeaderSponsorAssertion = "X-Sponsor-Assertion-Assertion"
 	HeaderSponsorSig       = "X-Sponsor-Assertion-Sig"
 	SponsorTTLSeconds      = int64(300)
 )
@@ -25,6 +28,7 @@ const (
 var (
 	ErrSponsorInvalid = errors.New("application: invalid sponsor assertion")
 	requestIDPattern  = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
+	sponsorJTIPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,200}$`)
 )
 
 type SponsorAssertionV1 struct {
@@ -142,8 +146,8 @@ func VerifySponsorHeaders(headers http.Header, publicKeys map[string]ed25519.Pub
 
 func validateSponsor(value SponsorAssertionV1) error {
 	if value.Version != 1 || !kidPattern.MatchString(value.KID) || value.Issuer != "https://id.w33d.xyz" || value.Audience != "access-governance" ||
-		!validVisible(value.Subject, 1, 256) || !jtiPattern.MatchString(value.JTI) || !requestIDPattern.MatchString(value.RequestID) || value.RequestVersion <= 0 ||
-		value.Method != http.MethodPost || value.NormalizedPath != "/api/v1/application-requests/"+value.RequestID+"/submit" ||
+		!validVisible(value.Subject, 1, 256) || !sponsorJTIPattern.MatchString(value.JTI) || !requestIDPattern.MatchString(value.RequestID) || value.RequestVersion <= 0 ||
+		value.Method != http.MethodPost || !sponsorSubmitPathMatches(value.NormalizedPath, value.RequestID) ||
 		!hexDigestPattern.MatchString(value.BodySHA256) || !hexDigestPattern.MatchString(value.SessionBinding) || value.AuthTime <= 0 ||
 		len(value.AMR) != 2 || value.AMR[0] != "passkey" || value.AMR[1] != "uv" || value.IssuedAt < value.AuthTime || value.IssuedAt-value.AuthTime > SponsorTTLSeconds || value.ExpiresAt-value.IssuedAt != SponsorTTLSeconds {
 		return ErrSponsorInvalid
@@ -167,8 +171,8 @@ type submitBody struct {
 }
 
 func ParseSponsorSubmit(request *http.Request, maxBytes int64) (SponsorAssertionV1, []byte, error) {
-	match := submitPathPattern.FindStringSubmatch(request.URL.Path)
-	if request.Method != http.MethodPost || len(match) != 2 {
+	requestID, surface, ok := sponsorSubmitSurface(request.URL.EscapedPath())
+	if request.Method != http.MethodPost || !ok || maxBytes <= 0 {
 		return SponsorAssertionV1{}, nil, ErrSponsorInvalid
 	}
 	body, err := io.ReadAll(io.LimitReader(request.Body, maxBytes+1))
@@ -176,16 +180,87 @@ func ParseSponsorSubmit(request *http.Request, maxBytes int64) (SponsorAssertion
 		return SponsorAssertionV1{}, nil, ErrSponsorInvalid
 	}
 	request.Body = io.NopCloser(bytes.NewReader(body))
-	var payload submitBody
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil || requireJSONEOF(decoder) != nil || payload.ExpectedVersion <= 0 {
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil {
+		return SponsorAssertionV1{}, nil, ErrSponsorInvalid
+	}
+	var expectedVersion int64
+	switch surface {
+	case sponsorSubmitJSON:
+		if mediaType != "application/json" || !uniqueTopLevelJSONFields(body) {
+			return SponsorAssertionV1{}, nil, ErrSponsorInvalid
+		}
+		var payload submitBody
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil || requireJSONEOF(decoder) != nil || payload.ExpectedVersion <= 0 {
+			return SponsorAssertionV1{}, nil, ErrSponsorInvalid
+		}
+		expectedVersion = payload.ExpectedVersion
+	case sponsorSubmitForm:
+		if mediaType != "application/x-www-form-urlencoded" {
+			return SponsorAssertionV1{}, nil, ErrSponsorInvalid
+		}
+		form, err := url.ParseQuery(string(body))
+		if err != nil || len(form) != 2 || len(form["expected_version"]) != 1 || len(form["csrf_token"]) != 1 {
+			return SponsorAssertionV1{}, nil, ErrSponsorInvalid
+		}
+		expectedVersion, err = parsePositiveDecimal(form["expected_version"][0])
+		if err != nil {
+			return SponsorAssertionV1{}, nil, ErrSponsorInvalid
+		}
+	default:
 		return SponsorAssertionV1{}, nil, ErrSponsorInvalid
 	}
 	digest := sha256.Sum256(body)
-	return SponsorAssertionV1{RequestID: match[1], RequestVersion: payload.ExpectedVersion, Method: http.MethodPost, NormalizedPath: request.URL.Path, BodySHA256: hex.EncodeToString(digest[:])}, body, nil
+	return SponsorAssertionV1{RequestID: requestID, RequestVersion: expectedVersion, Method: http.MethodPost, NormalizedPath: request.URL.EscapedPath(), BodySHA256: hex.EncodeToString(digest[:])}, body, nil
 }
 
-var submitPathPattern = regexp.MustCompile(`^/api/v1/application-requests/([A-Za-z0-9_-]{16,128})/submit$`)
+type sponsorSubmitKind int
 
-func IsSponsorSubmitPath(path string) bool { return submitPathPattern.MatchString(path) }
+const (
+	sponsorSubmitUnknown sponsorSubmitKind = iota
+	sponsorSubmitJSON
+	sponsorSubmitForm
+)
+
+var (
+	jsonSubmitPathPattern = regexp.MustCompile(`^/api/v1/application-requests/([A-Za-z0-9_-]{16,128})/submit$`)
+	formSubmitPathPattern = regexp.MustCompile(`^/applications/([A-Za-z0-9_-]{16,128})/submit$`)
+)
+
+func sponsorSubmitSurface(path string) (string, sponsorSubmitKind, bool) {
+	if match := jsonSubmitPathPattern.FindStringSubmatch(path); len(match) == 2 {
+		return match[1], sponsorSubmitJSON, true
+	}
+	if match := formSubmitPathPattern.FindStringSubmatch(path); len(match) == 2 {
+		return match[1], sponsorSubmitForm, true
+	}
+	return "", sponsorSubmitUnknown, false
+}
+
+func sponsorSubmitPathMatches(path, requestID string) bool {
+	matchedID, _, ok := sponsorSubmitSurface(path)
+	return ok && matchedID == requestID
+}
+
+func parsePositiveDecimal(value string) (int64, error) {
+	if value == "" || value[0] < '1' || value[0] > '9' {
+		return 0, ErrSponsorInvalid
+	}
+	for _, digit := range value[1:] {
+		if digit < '0' || digit > '9' {
+			return 0, ErrSponsorInvalid
+		}
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 || strconv.FormatInt(parsed, 10) != value {
+		return 0, ErrSponsorInvalid
+	}
+	return parsed, nil
+}
+
+func IsSponsorSubmitPath(path string) bool {
+	_, _, ok := sponsorSubmitSurface(path)
+	return ok
+}

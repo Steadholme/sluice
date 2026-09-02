@@ -16,7 +16,7 @@ const maxSponsorSubmitBodyBytes = int64(64 << 10)
 // mechanism that could manufacture an assertion offline.
 func sponsorAssertionWrap(route config.Route, next http.Handler, opts Options) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || !applicationSubmitPath(r.URL.Path) {
+		if r.Method != http.MethodPost || !applicationSubmitPath(r.URL.EscapedPath()) {
 			next.ServeHTTP(w, r)
 			return
 		}

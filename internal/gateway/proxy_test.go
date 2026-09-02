@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -586,56 +587,81 @@ func TestTrustedMFASponsorAssertionIssuedInPlaceAndStripsClientHeaders(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	seen := make(chan http.Header, 1)
+	type sponsorRequest struct {
+		headers http.Header
+		path    string
+		body    string
+	}
+	seen := make(chan sponsorRequest, 4)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen <- r.Header.Clone()
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen <- sponsorRequest{headers: r.Header.Clone(), path: r.URL.EscapedPath(), body: string(body)}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
-	route := mustRoutes(t, []config.Route{{Name: "access-applications", Match: config.Match{Host: "analyze.w33d.xyz", PathPrefix: "/api/v1/application-requests/"}, Upstream: upstream.URL, Auth: config.AuthSSO}}).Routes()[0]
+	route := mustRoutes(t, []config.Route{{Name: "access-applications", Match: config.Match{Host: "analyze.w33d.xyz", PathPrefix: "/"}, Upstream: upstream.URL, Auth: config.AuthSSO}}).Routes()[0]
 	proxy := newReverseProxy(route, nil, "", "", "", auth.AuthorizationContextV2Keyring{}, config.GatewayZoneExternal, "")
 	handler := sponsorAssertionWrap(route, proxy, Options{SponsorAssertionSigner: signer, Now: func() time.Time { return fixedNow }})
-	req := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/api/v1/application-requests/abcdefghijklmnop/submit", strings.NewReader(`{"expected_version":3}`))
-	for _, name := range []string{application.HeaderSponsorKID, application.HeaderSponsorAssertion, application.HeaderSponsorSig} {
-		req.Header.Add(name, "forged-one")
-		req.Header.Add(name, "forged-two")
-	}
-	ctx := auth.ContextWithIdentity(req.Context(), &auth.Identity{Subject: "usr_abcdefghijklmnop"})
+	ctx := auth.ContextWithIdentity(context.Background(), &auth.Identity{Subject: "usr_abcdefghijklmnop"})
 	mfa := auth.MFAAssertion{Subject: "usr_abcdefghijklmnop", AAL: auth.MFAAALStrong, UV: true, AuthTime: fixedNow.Unix() - 10, SessionBinding: strings.Repeat("a", 64), FactorEpoch: 2, Route: route.Name, Audience: "access-governance", Evidence: strings.Repeat("b", 64), Timestamp: fixedNow.Unix()}
 	ctx = auth.ContextWithMFAAssertion(ctx, mfa, "test-signature")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req.WithContext(ctx))
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
-	}
-	headers := <-seen
-	assertion, err := application.VerifySponsorHeaders(headers, map[string]ed25519.PublicKey{"appctx-2026a": private.Public().(ed25519.PublicKey)}, fixedNow)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if assertion.RequestID != "abcdefghijklmnop" || assertion.RequestVersion != 3 || assertion.SessionBinding != strings.Repeat("a", 64) || assertion.AuthTime != fixedNow.Unix()-10 || len(assertion.AMR) != 2 {
-		t.Fatalf("assertion=%+v", assertion)
-	}
-	for _, name := range []string{application.HeaderSponsorKID, application.HeaderSponsorAssertion, application.HeaderSponsorSig} {
-		if len(headers.Values(name)) != 1 {
-			t.Fatalf("%s=%q", name, headers.Values(name))
-		}
+	for _, tc := range []struct {
+		name        string
+		path        string
+		contentType string
+		body        string
+		version     int64
+	}{
+		{name: "json-api", path: "/api/v1/application-requests/abcdefghijklmnop/submit", contentType: "application/json", body: `{"expected_version":3}`, version: 3},
+		{name: "html-form", path: "/applications/abcdefghijklmnop/submit", contentType: "application/x-www-form-urlencoded", body: "csrf_token=csrf-value&expected_version=4", version: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz"+tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", tc.contentType)
+			for _, name := range []string{application.HeaderSponsorKID, application.HeaderSponsorAssertion, application.HeaderSponsorSig, "X-Sponsor-Assertion", "X-Sponsor-Assertion-Attacker"} {
+				req.Header.Add(name, "forged-one")
+				req.Header.Add(name, "forged-two")
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req.WithContext(ctx))
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+			}
+			got := <-seen
+			if got.path != tc.path || got.body != tc.body {
+				t.Fatalf("path=%q body=%q", got.path, got.body)
+			}
+			assertion, err := application.VerifySponsorHeaders(got.headers, map[string]ed25519.PublicKey{"appctx-2026a": private.Public().(ed25519.PublicKey)}, fixedNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodyDigest := sha256.Sum256([]byte(tc.body))
+			if assertion.RequestID != "abcdefghijklmnop" || assertion.RequestVersion != tc.version || assertion.NormalizedPath != tc.path || assertion.BodySHA256 != hex.EncodeToString(bodyDigest[:]) || assertion.SessionBinding != strings.Repeat("a", 64) || assertion.AuthTime != fixedNow.Unix()-10 || len(assertion.AMR) != 2 {
+				t.Fatalf("assertion=%+v", assertion)
+			}
+			assertExactSponsorHeaderTriplet(t, got.headers)
+		})
 	}
 
-	nonSubmit := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/api/v1/application-requests/abcdefghijklmnop/cancel", strings.NewReader(`{"expected_version":3}`))
-	nonSubmit.Header.Set(application.HeaderSponsorAssertion, "forged")
+	nonSubmit := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/applications/abcdefghijklmnop/cancel", strings.NewReader("csrf_token=csrf&expected_version=3"))
+	for _, name := range []string{application.HeaderSponsorKID, application.HeaderSponsorAssertion, application.HeaderSponsorSig, "X-Sponsor-Assertion", "X-Sponsor-Assertion-Attacker"} {
+		nonSubmit.Header.Set(name, "forged")
+	}
 	nonSubmitRecorder := httptest.NewRecorder()
 	handler.ServeHTTP(nonSubmitRecorder, nonSubmit.WithContext(ctx))
 	if nonSubmitRecorder.Code != http.StatusNoContent {
 		t.Fatalf("non-submit status=%d body=%q", nonSubmitRecorder.Code, nonSubmitRecorder.Body.String())
 	}
-	for name, values := range <-seen {
+	for name, values := range (<-seen).headers {
 		if strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Sponsor-Assertion") && len(values) != 0 {
 			t.Fatalf("non-submit forwarded %s=%q", name, values)
 		}
 	}
-
 	stale := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/api/v1/application-requests/abcdefghijklmnop/submit", strings.NewReader(`{"expected_version":3}`))
+	stale.Header.Set("Content-Type", "application/json")
 	staleMFA := mfa
 	staleMFA.AuthTime = fixedNow.Unix() - application.SponsorTTLSeconds - 1
 	staleContext := auth.ContextWithMFAAssertion(ctx, staleMFA, "test-signature")
@@ -643,6 +669,29 @@ func TestTrustedMFASponsorAssertionIssuedInPlaceAndStripsClientHeaders(t *testin
 	handler.ServeHTTP(staleRecorder, stale.WithContext(staleContext))
 	if staleRecorder.Code != http.StatusUnauthorized {
 		t.Fatalf("stale MFA status=%d body=%q", staleRecorder.Code, staleRecorder.Body.String())
+	}
+}
+
+func assertExactSponsorHeaderTriplet(t *testing.T, headers http.Header) {
+	t.Helper()
+	expected := map[string]bool{
+		http.CanonicalHeaderKey(application.HeaderSponsorKID):       true,
+		http.CanonicalHeaderKey(application.HeaderSponsorAssertion): true,
+		http.CanonicalHeaderKey(application.HeaderSponsorSig):       true,
+	}
+	seen := 0
+	for name, values := range headers {
+		canonical := http.CanonicalHeaderKey(name)
+		if !strings.HasPrefix(canonical, "X-Sponsor-Assertion") {
+			continue
+		}
+		if !expected[canonical] || len(values) != 1 {
+			t.Fatalf("unexpected sponsor header %s=%q", name, values)
+		}
+		seen++
+	}
+	if seen != len(expected) {
+		t.Fatalf("sponsor header count=%d want=%d", seen, len(expected))
 	}
 }
 

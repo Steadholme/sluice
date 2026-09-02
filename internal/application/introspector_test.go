@@ -2,17 +2,50 @@ package application
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
 
 const testApplicationToken = "app_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+func TestAccessApplicationIntrospectionSharedKnownVector(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/application_introspection_active_v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(fixture)
+	if got := hex.EncodeToString(digest[:]); got != "6b14e68f060408b720291a55d58020a5df7f3c24ceedc2532e49f9cd404fcc28" {
+		t.Fatalf("fixture digest=%s", got)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(fixture)
+	}))
+	defer server.Close()
+	client, err := NewAccessIntrospector(IntrospectorConfig{
+		Endpoint: server.URL, ServiceToken: strings.Repeat("s", 32), Client: server.Client(),
+		Now: func() time.Time { return time.Unix(1_900_000_000, 0) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Active || result.Subject != "application:abcdefghijklmnop" || result.ApplicationSub != result.Subject || result.Audience != "analyze-facade" || result.Fingerprint != strings.Repeat("b", 64) || result.ClientID != "app_abcdefghijklmnop" || result.CredentialID != "acr_abcdefghijklmnop" || result.GrantID != "grt_abcdefghijklmnop" || result.CredentialState != CredentialActive || result.OverlapUntil != nil || result.PolicyEpoch != 11 || result.RevocationEpoch != 13 {
+		t.Fatalf("result=%+v", result)
+	}
+}
 
 func TestApplicationIntrospectionRequiresEqualSubjectEpochsAndCredentialState(t *testing.T) {
 	const sessionDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
