@@ -2,7 +2,6 @@ package application
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,6 +37,7 @@ func TestApplicationMiddlewareMapsFrozenErrorsAndDoesNotDispatchOnOutage(t *test
 			handler := Middleware(tc.introspector, "analyze-facade", "", http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched = true }))
 			req := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/mcp", strings.NewReader("{}"))
 			req.Header.Set("Authorization", tc.authorization)
+			req.Header.Set("Mcp-Session-Id", "session_abcdefghijklmnop")
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, req)
 			if rec.Code != tc.status || !strings.Contains(rec.Body.String(), `"code":"`+tc.code+`"`) || dispatched {
@@ -50,30 +50,34 @@ func TestApplicationMiddlewareMapsFrozenErrorsAndDoesNotDispatchOnOutage(t *test
 	}
 }
 
-func TestBoundSessionInvalidationUsesInvalidSession(t *testing.T) {
-	introspector := &stubIntrospector{err: ErrSessionInvalid}
-	handler := Middleware(introspector, "analyze-facade", "", http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("dispatched") }))
-	req := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/mcp", strings.NewReader("{}"))
-	req.Header.Set("Authorization", "Bearer "+testApplicationToken)
-	req.Header.Set("Mcp-Session-Id", "session_abcdefghijklmnop")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), `"code":"invalid_session"`) {
-		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
-	}
-	if !errors.Is(introspector.err, ErrSessionInvalid) {
-		t.Fatal("wrong stub")
+func TestSessionConflictRequiresValidInboundMCPSession(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		session    *string
+		wantStatus int
+		wantCode   string
+		wantCalls  int
+	}{
+		{name: "absent", wantStatus: http.StatusUnauthorized, wantCode: "unauthenticated"},
+		{name: "empty", session: stringPointer(""), wantStatus: http.StatusUnauthorized, wantCode: "unauthenticated"},
+		{name: "malformed", session: stringPointer("contains space"), wantStatus: http.StatusUnauthorized, wantCode: "unauthenticated"},
+		{name: "present", session: stringPointer("session_abcdefghijklmnop"), wantStatus: http.StatusNotFound, wantCode: "invalid_session", wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			introspector := &stubIntrospector{err: ErrSessionInvalid}
+			handler := Middleware(introspector, "analyze-facade", "", http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("dispatched") }))
+			req := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/mcp", strings.NewReader("{}"))
+			req.Header.Set("Authorization", "Bearer "+testApplicationToken)
+			if tc.session != nil {
+				req.Header.Set("Mcp-Session-Id", *tc.session)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus || !strings.Contains(rec.Body.String(), `"code":"`+tc.wantCode+`"`) || introspector.calls != tc.wantCalls {
+				t.Fatalf("status=%d body=%q calls=%d", rec.Code, rec.Body.String(), introspector.calls)
+			}
+		})
 	}
 }
 
-func TestIntrospectionSessionConflictWithoutClientSessionStillUsesInvalidSession(t *testing.T) {
-	introspector := &stubIntrospector{err: ErrSessionInvalid}
-	handler := Middleware(introspector, "analyze-facade", "", http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("dispatched") }))
-	req := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/mcp", strings.NewReader("{}"))
-	req.Header.Set("Authorization", "Bearer "+testApplicationToken)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), `"code":"invalid_session"`) {
-		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
-	}
-}
+func stringPointer(value string) *string { return &value }

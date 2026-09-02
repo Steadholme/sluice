@@ -49,9 +49,9 @@ func MiddlewareWithSigner(introspector Introspector, signer *ContextSigner, rout
 			writeError(w, http.StatusUnauthorized, "unauthenticated", false)
 			return
 		}
-		sessionID, ok := optionalSingleHeader(r.Header, "Mcp-Session-Id")
+		sessionID, ok := applicationSessionIdentifier(r.Header)
 		if !ok {
-			writeError(w, http.StatusBadRequest, "invalid_request", false)
+			writeError(w, http.StatusUnauthorized, "unauthenticated", false)
 			return
 		}
 		sessionHash := sha256.Sum256([]byte(sessionID))
@@ -163,6 +163,15 @@ func requestIdentifier(header http.Header, name string) (string, bool) {
 		return "", false
 	}
 	return value, true
+}
+
+func applicationSessionIdentifier(header http.Header) (string, bool) {
+	values := header.Values("Mcp-Session-Id")
+	returnValue := ""
+	if len(values) == 1 {
+		returnValue = values[0]
+	}
+	return returnValue, len(values) == 1 && validVisible(returnValue, 1, 256)
 }
 
 func randomIdentifier(prefix string) (string, error) {
