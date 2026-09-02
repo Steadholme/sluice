@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/holdfast/sluice/internal/application"
 )
 
 // Default values mirror the shared integration contract: Sluice binds
@@ -87,7 +89,11 @@ const (
 	// EnvPATIntrospectionURL is the explicit INTERNAL Keystone endpoint used only
 	// by auth="pat" routes. It is never derived from the public issuer: leaving it
 	// unset keeps PAT routes fail-closed without changing any other auth mode.
-	EnvPATIntrospectionURL = "PAT_INTROSPECTION_URL"
+	EnvPATIntrospectionURL              = "PAT_INTROSPECTION_URL"
+	EnvApplicationIntrospectionURL      = "ACCESS_APPLICATION_INTROSPECTION_URL"
+	EnvApplicationIntrospectionToken    = "ACCESS_INTROSPECTION_TOKEN"
+	EnvApplicationContextActiveKID      = "SLUICE_APPLICATION_CONTEXT_ACTIVE_KID"
+	EnvApplicationContextSigningKeyring = "SLUICE_APPLICATION_CONTEXT_SIGNING_KEYRING"
 )
 
 // TLS termination modes selectable via EnvTLSMode.
@@ -114,6 +120,7 @@ const (
 	AuthPublic      = "public"
 	AuthBearer      = "bearer"
 	AuthPAT         = "pat"
+	AuthApplication = "application"
 	AuthSSO         = "sso"
 	AuthSSOOptional = "sso-optional"
 )
@@ -311,9 +318,13 @@ type Config struct {
 	// PATIntrospectionURL is the explicit internal Keystone opaque-PAT
 	// introspection endpoint. Empty is permitted at startup; PAT routes then
 	// return 503 while all existing auth modes retain their behavior.
-	PATIntrospectionURL  string        `json:"pat_introspection_url"`
-	JWKSRefreshInterval  time.Duration `json:"jwks_refresh_interval"`
-	JWKSRotationCooldown time.Duration `json:"jwks_rotation_cooldown"`
+	PATIntrospectionURL              string        `json:"pat_introspection_url"`
+	ApplicationIntrospectionURL      string        `json:"application_introspection_url"`
+	ApplicationIntrospectionToken    string        `json:"application_introspection_token"`
+	ApplicationContextActiveKID      string        `json:"application_context_active_kid"`
+	ApplicationContextSigningKeyring string        `json:"application_context_signing_keyring"`
+	JWKSRefreshInterval              time.Duration `json:"jwks_refresh_interval"`
+	JWKSRotationCooldown             time.Duration `json:"jwks_rotation_cooldown"`
 
 	// TLS termination + public exposure. Defaults keep TLSMode=off so existing
 	// deployments and tests bind a single plain HTTP listener on ListenAddr.
@@ -490,6 +501,18 @@ func (c *Config) ApplyEnv() {
 	}
 	if v := os.Getenv(EnvPATIntrospectionURL); v != "" {
 		c.PATIntrospectionURL = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvApplicationIntrospectionURL); v != "" {
+		c.ApplicationIntrospectionURL = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvApplicationIntrospectionToken); v != "" {
+		c.ApplicationIntrospectionToken = v
+	}
+	if v := os.Getenv(EnvApplicationContextActiveKID); v != "" {
+		c.ApplicationContextActiveKID = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvApplicationContextSigningKeyring); v != "" {
+		c.ApplicationContextSigningKeyring = v
 	}
 	if v := os.Getenv(EnvJWKSRotationCooldown); v != "" {
 		// Go duration string (e.g. "5s"); a malformed value is treated as unset so
@@ -747,6 +770,9 @@ func (c *Config) Validate() error {
 	if err := c.validateTrustedMFA(); err != nil {
 		return err
 	}
+	if err := c.validateApplicationAuth(); err != nil {
+		return err
+	}
 	if c.RBACEnabled {
 		if c.VerdictURL == "" {
 			return fmt.Errorf("rbac_enabled requires verdict_url")
@@ -812,6 +838,9 @@ func (c *Config) Validate() error {
 
 		if err := normalizeAuth(r); err != nil {
 			return fmt.Errorf("route %q: %w", routeName(r, i), err)
+		}
+		if r.Auth == AuthApplication && u.Path != "" && u.Path != "/" {
+			return fmt.Errorf("route %q: auth=application requires an upstream without a path prefix", routeName(r, i))
 		}
 		if err := validateRouteScope(r); err != nil {
 			return fmt.Errorf("route %q: %w", routeName(r, i), err)
@@ -1089,9 +1118,9 @@ func normalizeAuth(r *Route) error {
 		}
 	}
 	switch r.Auth {
-	case AuthPublic, AuthBearer, AuthPAT, AuthSSO, AuthSSOOptional:
+	case AuthPublic, AuthBearer, AuthPAT, AuthApplication, AuthSSO, AuthSSOOptional:
 	default:
-		return fmt.Errorf("invalid auth %q (want %s|%s|%s|%s|%s)", r.Auth, AuthPublic, AuthBearer, AuthPAT, AuthSSO, AuthSSOOptional)
+		return fmt.Errorf("invalid auth %q (want %s|%s|%s|%s|%s|%s)", r.Auth, AuthPublic, AuthBearer, AuthPAT, AuthApplication, AuthSSO, AuthSSOOptional)
 	}
 	r.Protected = r.Auth != AuthPublic
 	return nil
@@ -1103,19 +1132,45 @@ func normalizeAuth(r *Route) error {
 // scope response.
 func validateRouteScope(r *Route) error {
 	raw := r.RequireScope
-	if r.Auth != AuthPAT {
+	if r.Auth != AuthPAT && r.Auth != AuthApplication {
 		if raw != "" {
 			return fmt.Errorf("require_scope is only valid with auth=%s", AuthPAT)
 		}
 		return nil
 	}
 	r.RequireScope = strings.TrimSpace(raw)
+	if r.RequireScope == "" && r.Auth == AuthApplication {
+		return nil
+	}
 	if r.RequireScope == "" {
 		return fmt.Errorf("auth=%s requires require_scope", AuthPAT)
 	}
 	fields := strings.Fields(r.RequireScope)
 	if len(fields) != 1 || fields[0] != r.RequireScope {
 		return fmt.Errorf("require_scope must be exactly one scope token")
+	}
+	return nil
+}
+
+func (c *Config) validateApplicationAuth() error {
+	configured := c.ApplicationIntrospectionURL != "" || c.ApplicationIntrospectionToken != "" || c.ApplicationContextActiveKID != "" || c.ApplicationContextSigningKeyring != ""
+	if !configured {
+		return nil
+	}
+	endpoint, err := url.Parse(strings.TrimSpace(c.ApplicationIntrospectionURL))
+	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		return fmt.Errorf("application auth requires an absolute application_introspection_url without userinfo, query, or fragment")
+	}
+	if err := validateVisibleASCIISecret("application_introspection_token", c.ApplicationIntrospectionToken); err != nil {
+		return err
+	}
+	if _, err := application.ParseSigningKeyring(c.ApplicationContextActiveKID, c.ApplicationContextSigningKeyring); err != nil {
+		return fmt.Errorf("application auth requires a complete Ed25519 active KID and signing keyring")
+	}
+	for _, other := range []string{c.GWClientSecret, c.GWSessionSecret, c.GWSessionRevocationToken, c.KeystoneAssuranceServiceToken, c.MFAAssertionHMACKey, c.AuditIngestToken, c.VerdictDecisionToken, c.GatewayHMACKey, c.GatewayZoneHMACKey, c.GatewayAuthzHMACKey} {
+		if other != "" && c.ApplicationIntrospectionToken == other {
+			return fmt.Errorf("application_introspection_token must be distinct from other gateway credentials")
+		}
 	}
 	return nil
 }

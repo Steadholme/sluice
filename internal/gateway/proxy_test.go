@@ -1,8 +1,12 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/holdfast/sluice/internal/application"
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
 	"github.com/holdfast/sluice/internal/oidc"
@@ -22,6 +27,17 @@ type unusedKeyResolver struct{}
 type gatewayPATIntrospector struct {
 	result pat.Result
 	err    error
+}
+
+type gatewayApplicationIntrospector struct {
+	result application.Result
+	err    error
+	calls  int
+}
+
+func (i *gatewayApplicationIntrospector) Introspect(context.Context, string, string) (application.Result, error) {
+	i.calls++
+	return i.result, i.err
 }
 
 func (i gatewayPATIntrospector) Introspect(context.Context, string) (pat.Result, error) {
@@ -495,6 +511,142 @@ func TestAllowedPermissionContextDualWritesCompleteV2Headers(t *testing.T) {
 		t.Fatal("legacy v1 authorization context was not preserved during v2 dual-write")
 	}
 }
+
+func TestApplicationProxyStripsCredentialAndBindsCompleteContext(t *testing.T) {
+	fixedNow := time.Unix(1_900_000_000, 0)
+	private := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{6}, ed25519.SeedSize))
+	signer, err := application.NewContextSigner(application.SigningKeyring{
+		ActiveKID: "appctx-2026a", PrivateKeys: map[string]ed25519.PrivateKey{"appctx-2026a": private},
+	}, func() time.Time { return fixedNow }, bytes.NewReader(bytes.Repeat([]byte{3}, 64)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	digest := hex.EncodeToString(bytes.Repeat([]byte{4}, 32))
+	introspector := &gatewayApplicationIntrospector{result: application.Result{
+		Active: true, Subject: "application:abcdefghijklmnop", ApplicationSub: "application:abcdefghijklmnop",
+		Scopes: []string{"analysis.create", "analysis.read"}, ExpiresAt: fixedNow.Unix() + 600,
+		ClientID: "client_abcdefghijklmnop", CredentialID: "cred_abcdefghijklmnop", Fingerprint: digest,
+		GrantID: "grant_abcdefghijklmnop", PackageID: "pkg_analyze_mcp_client", PackageRevisionDigest: digest,
+		Audience: "analyze-facade", CredentialVersion: 2, SubjectVersion: 4,
+		CredentialState: application.CredentialActive, PolicyEpoch: 7, RevocationEpoch: 9,
+	}}
+	store := mustRoutes(t, []config.Route{{Name: "analyze-mcp", Match: config.Match{Host: "analyze.w33d.xyz", PathPrefix: "/mcp"}, Upstream: upstream.URL, Auth: config.AuthApplication}})
+	handler := NewServer(store, Options{ApplicationIntrospector: introspector, ApplicationContextSigner: signer}).Handler()
+	body := `{"jsonrpc":"2.0","method":"tools/list"}`
+	req := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/mcp", strings.NewReader(body))
+	req.Host = "analyze.w33d.xyz"
+	req.Header.Set("Authorization", "Bearer "+applicationTokenForGatewayTest)
+	req.Header.Set("Cookie", "__Secure-gw=must-not-pass; app=value")
+	req.Header.Set("Mcp-Session-Id", "session_abcdefghijklmnop")
+	req.Header.Set("X-Request-Id", "req_abcdefghijklmnop")
+	req.Header.Set("X-Correlation-Id", "corr_abcdefghijklmnop")
+	req.Header.Add(application.HeaderContext, "forged-one")
+	req.Header.Add(application.HeaderContext, "forged-two")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	got := <-seen
+	if got.Get("Authorization") != "" || got.Get("Cookie") != "" {
+		t.Fatalf("raw credentials reached upstream")
+	}
+	for _, name := range []string{application.HeaderKID, application.HeaderContext, application.HeaderSig} {
+		if values := got.Values(name); len(values) != 1 || strings.HasPrefix(values[0], "forged") {
+			t.Fatalf("%s=%q", name, values)
+		}
+	}
+	bodyHash := sha256.Sum256([]byte(body))
+	sessionHash := sha256.Sum256([]byte("session_abcdefghijklmnop"))
+	verified, err := application.VerifyContextHeaders(got, application.VerificationKeyring{Keys: map[string]application.VerificationKey{"appctx-2026a": {PublicKey: private.Public().(ed25519.PublicKey)}}}, fixedNow, application.ExpectedRequest{
+		Audience: "analyze-facade", Route: "analyze-mcp", Method: http.MethodPost, NormalizedPath: "/mcp",
+		BodySHA256: hex.EncodeToString(bodyHash[:]), RequestID: "req_abcdefghijklmnop", MCPSessionDigest: hex.EncodeToString(sessionHash[:]),
+	}, application.NewMemoryReplayGuard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.CredentialState != application.CredentialActive || verified.OverlapUntil != nil || verified.CorrelationID != "corr_abcdefghijklmnop" || verified.PolicyEpoch != 7 || verified.RevocationEpoch != 9 {
+		t.Fatalf("verified=%+v", verified)
+	}
+	if introspector.calls != 1 {
+		t.Fatalf("introspection calls=%d", introspector.calls)
+	}
+}
+
+func TestTrustedMFASponsorAssertionIssuedInPlaceAndStripsClientHeaders(t *testing.T) {
+	fixedNow := time.Unix(1_900_000_000, 0)
+	private := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{5}, ed25519.SeedSize))
+	signer, err := application.NewSponsorSigner(application.SigningKeyring{ActiveKID: "appctx-2026a", PrivateKeys: map[string]ed25519.PrivateKey{"appctx-2026a": private}}, func() time.Time { return fixedNow }, bytes.NewReader(bytes.Repeat([]byte{2}, 64)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	route := mustRoutes(t, []config.Route{{Name: "access-applications", Match: config.Match{Host: "analyze.w33d.xyz", PathPrefix: "/api/v1/application-requests/"}, Upstream: upstream.URL, Auth: config.AuthSSO}}).Routes()[0]
+	proxy := newReverseProxy(route, nil, "", "", "", auth.AuthorizationContextV2Keyring{}, config.GatewayZoneExternal, "")
+	handler := sponsorAssertionWrap(route, proxy, Options{SponsorAssertionSigner: signer, Now: func() time.Time { return fixedNow }})
+	req := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/api/v1/application-requests/abcdefghijklmnop/submit", strings.NewReader(`{"expected_version":3}`))
+	for _, name := range []string{application.HeaderSponsorKID, application.HeaderSponsorAssertion, application.HeaderSponsorSig} {
+		req.Header.Add(name, "forged-one")
+		req.Header.Add(name, "forged-two")
+	}
+	ctx := auth.ContextWithIdentity(req.Context(), &auth.Identity{Subject: "usr_abcdefghijklmnop"})
+	mfa := auth.MFAAssertion{Subject: "usr_abcdefghijklmnop", AAL: auth.MFAAALStrong, UV: true, AuthTime: fixedNow.Unix() - 10, SessionBinding: strings.Repeat("a", 64), FactorEpoch: 2, Route: route.Name, Audience: "access-governance", Evidence: strings.Repeat("b", 64), Timestamp: fixedNow.Unix()}
+	ctx = auth.ContextWithMFAAssertion(ctx, mfa, "test-signature")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req.WithContext(ctx))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	headers := <-seen
+	assertion, err := application.VerifySponsorHeaders(headers, map[string]ed25519.PublicKey{"appctx-2026a": private.Public().(ed25519.PublicKey)}, fixedNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assertion.RequestID != "abcdefghijklmnop" || assertion.RequestVersion != 3 || assertion.SessionBinding != strings.Repeat("a", 64) || assertion.AuthTime != fixedNow.Unix()-10 || len(assertion.AMR) != 2 {
+		t.Fatalf("assertion=%+v", assertion)
+	}
+	for _, name := range []string{application.HeaderSponsorKID, application.HeaderSponsorAssertion, application.HeaderSponsorSig} {
+		if len(headers.Values(name)) != 1 {
+			t.Fatalf("%s=%q", name, headers.Values(name))
+		}
+	}
+
+	nonSubmit := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/api/v1/application-requests/abcdefghijklmnop/cancel", strings.NewReader(`{"expected_version":3}`))
+	nonSubmit.Header.Set(application.HeaderSponsorAssertion, "forged")
+	nonSubmitRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(nonSubmitRecorder, nonSubmit.WithContext(ctx))
+	if nonSubmitRecorder.Code != http.StatusNoContent {
+		t.Fatalf("non-submit status=%d body=%q", nonSubmitRecorder.Code, nonSubmitRecorder.Body.String())
+	}
+	for name, values := range <-seen {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Sponsor-Assertion") && len(values) != 0 {
+			t.Fatalf("non-submit forwarded %s=%q", name, values)
+		}
+	}
+
+	stale := httptest.NewRequest(http.MethodPost, "https://analyze.w33d.xyz/api/v1/application-requests/abcdefghijklmnop/submit", strings.NewReader(`{"expected_version":3}`))
+	staleMFA := mfa
+	staleMFA.AuthTime = fixedNow.Unix() - application.SponsorTTLSeconds - 1
+	staleContext := auth.ContextWithMFAAssertion(ctx, staleMFA, "test-signature")
+	staleRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(staleRecorder, stale.WithContext(staleContext))
+	if staleRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("stale MFA status=%d body=%q", staleRecorder.Code, staleRecorder.Body.String())
+	}
+}
+
+const applicationTokenForGatewayTest = "app_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 func headerHasValue(values []string, want string) bool {
 	for _, value := range values {

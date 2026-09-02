@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/holdfast/sluice/internal/accesslog"
+	"github.com/holdfast/sluice/internal/application"
 	"github.com/holdfast/sluice/internal/audit"
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
@@ -43,10 +44,15 @@ type Options struct {
 	// deliberately separate from Verifier so bearer remains JWT-only. Nil makes
 	// PAT routes fail closed with 503 and does not affect any other route.
 	PATIntrospector pat.Introspector
-	Provider        *oidc.Provider
-	Transport       *http.Transport
-	Auditor         *audit.Emitter
-	WAF             *waf.Engine
+	// ApplicationIntrospector and ApplicationContextSigner form the independent
+	// auth="application" boundary. Nil keeps only those routes fail-closed.
+	ApplicationIntrospector  application.Introspector
+	ApplicationContextSigner *application.ContextSigner
+	SponsorAssertionSigner   *application.SponsorSigner
+	Provider                 *oidc.Provider
+	Transport                *http.Transport
+	Auditor                  *audit.Emitter
+	WAF                      *waf.Engine
 	// Authz is the optional Verdict-backed RBAC authorizer. Plain SSO routes keep
 	// working when it is nil or disabled, but a route declaring require_group
 	// fails closed with 503 until the authorizer is fully configured.
@@ -97,7 +103,7 @@ type Options struct {
 
 // Server is the assembled Sluice HTTP handler: /healthz, the gateway-owned
 // /_gw/* OIDC endpoints, route dispatch with per-route reverse proxies, and
-// per-route auth (public / bearer / pat / sso / sso-optional), all wrapped in the structured
+// per-route auth (public / bearer / pat / application / sso / sso-optional), all wrapped in the structured
 // access-log handler.
 type Server struct {
 	router     *Router
@@ -159,6 +165,8 @@ func NewServer(s store.RouteStore, opts Options) *Server {
 			// Keep privacy headers outside the optional WAF so every PAT-route
 			// outcome, not just introspection and upstream responses, is no-store.
 			handler = pat.NoStore(handler)
+		} else if route.Auth == config.AuthApplication {
+			handler = application.NoStore(handler)
 		}
 		srv.handlers[routeKey(route)] = routeHandler{
 			route:   route,
@@ -175,6 +183,8 @@ func authWrap(route config.Route, proxy http.Handler, opts Options) http.Handler
 		return auth.Middleware(opts.Verifier, proxy, auth.WithAuditor(opts.Auditor))
 	case config.AuthPAT:
 		return pat.Middleware(opts.PATIntrospector, route.RequireScope, proxy)
+	case config.AuthApplication:
+		return application.MiddlewareWithSigner(opts.ApplicationIntrospector, opts.ApplicationContextSigner, route.Name, "analyze-facade", route.RequireScope, proxy)
 	case config.AuthSSO:
 		if opts.Provider == nil {
 			// Fail closed: SSO requested but the relying party is not configured.
@@ -188,6 +198,7 @@ func authWrap(route config.Route, proxy http.Handler, opts Options) http.Handler
 		// plain SSO when Verdict is unconfigured. Ungated routes retain advisory,
 		// fail-open group decoration for backward compatibility.
 		inner := rbacWrap(route, proxy, opts)
+		inner = sponsorAssertionWrap(route, inner, opts)
 		inner = trustedMFAWrap(route, inner, opts)
 		return opts.Provider.Middleware(inner)
 	case config.AuthSSOOptional:

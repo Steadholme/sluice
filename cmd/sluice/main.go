@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/holdfast/sluice/internal/application"
 	"github.com/holdfast/sluice/internal/audit"
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
@@ -78,6 +79,7 @@ func main() {
 	cancel()
 	verifier := auth.NewVerifierWithAudience(jwks, cfg.KeystoneIssuer, cfg.BearerAudience)
 	patIntrospector := buildPATIntrospector(cfg, internalClient, log)
+	applicationIntrospector, applicationContextSigner, sponsorAssertionSigner := buildApplicationAuth(cfg, internalClient, log)
 
 	// Non-blocking audit emitter (env-toggled by AUDIT_ENABLED). When off it is a
 	// no-op; when on it fire-and-forget POSTs security events to Watchtower without
@@ -134,18 +136,21 @@ func main() {
 	acmeHosts := gateway.RouteHostSet(routeStore, cfg.ACMEDomain, apexHost(cfg))
 
 	opts := gateway.Options{
-		Verifier:             verifier,
-		PATIntrospector:      patIntrospector,
-		Provider:             provider,
-		Transport:            mtlsTransport,
-		Auditor:              auditor,
-		WAF:                  wafEngine,
-		Authz:                authz,
-		PublicOnly:           cfg.PublicOnly,
-		PublicOnlyAllowHosts: hostSet(cfg.PublicOnlyAllow),
-		GatewayHMACKey:       cfg.GatewayHMACKey,
-		GatewayZoneHMACKey:   cfg.GatewayZoneHMACKey,
-		GatewayAuthzHMACKey:  cfg.GatewayAuthzHMACKey,
+		Verifier:                 verifier,
+		PATIntrospector:          patIntrospector,
+		ApplicationIntrospector:  applicationIntrospector,
+		ApplicationContextSigner: applicationContextSigner,
+		SponsorAssertionSigner:   sponsorAssertionSigner,
+		Provider:                 provider,
+		Transport:                mtlsTransport,
+		Auditor:                  auditor,
+		WAF:                      wafEngine,
+		Authz:                    authz,
+		PublicOnly:               cfg.PublicOnly,
+		PublicOnlyAllowHosts:     hostSet(cfg.PublicOnlyAllow),
+		GatewayHMACKey:           cfg.GatewayHMACKey,
+		GatewayZoneHMACKey:       cfg.GatewayZoneHMACKey,
+		GatewayAuthzHMACKey:      cfg.GatewayAuthzHMACKey,
 		GatewayAuthzContextV2Keys: auth.AuthorizationContextV2Keyring{
 			Current: auth.AuthorizationContextV2Key{
 				KID: cfg.GatewayAuthzContextV2HMACKIDCurrent,
@@ -179,6 +184,8 @@ func main() {
 		"internal_mtls", mtlsTransport != nil,
 		"oidc_sso", provider != nil,
 		"pat_introspection", patIntrospector != nil,
+		"application_introspection", applicationIntrospector != nil,
+		"application_signing", applicationContextSigner != nil,
 		"audit", cfg.AuditEnabled,
 		"waf", cfg.WAFEnabled,
 		"rbac", authz.Enabled(),
@@ -191,6 +198,35 @@ func main() {
 		log.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func buildApplicationAuth(cfg *config.Config, internalClient *http.Client, log *slog.Logger) (application.Introspector, *application.ContextSigner, *application.SponsorSigner) {
+	if strings.TrimSpace(cfg.ApplicationIntrospectionURL) == "" || strings.TrimSpace(cfg.ApplicationContextActiveKID) == "" || cfg.ApplicationContextSigningKeyring == "" {
+		return nil, nil, nil
+	}
+	introspector, err := application.NewAccessIntrospector(application.IntrospectorConfig{
+		Endpoint: cfg.ApplicationIntrospectionURL, ServiceToken: cfg.ApplicationIntrospectionToken, Client: internalClient,
+	})
+	if err != nil {
+		log.Error("application introspection unavailable; application routes will 503", "error", err)
+		return nil, nil, nil
+	}
+	keyring, err := application.ParseSigningKeyring(cfg.ApplicationContextActiveKID, cfg.ApplicationContextSigningKeyring)
+	if err != nil {
+		log.Error("application signing unavailable; application routes will 503", "error", err)
+		return nil, nil, nil
+	}
+	contextSigner, err := application.NewContextSigner(keyring, nil, nil)
+	if err != nil {
+		log.Error("application context signing unavailable; application routes will 503", "error", err)
+		return nil, nil, nil
+	}
+	sponsorSigner, err := application.NewSponsorSigner(keyring, nil, nil)
+	if err != nil {
+		log.Error("sponsor assertion signing unavailable; sponsor submit will 503", "error", err)
+		return nil, nil, nil
+	}
+	return introspector, contextSigner, sponsorSigner
 }
 
 func buildAssuranceLookup(cfg *config.Config, internalClient *http.Client, log *slog.Logger) oidc.AssuranceLookup {

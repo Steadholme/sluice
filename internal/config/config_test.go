@@ -1,6 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -33,6 +37,71 @@ func validTrustedMFAConfig() *Config {
 	c.GatewayZoneHMACKey = strings.Repeat("z", 32)
 	c.GatewayAuthzHMACKey = strings.Repeat("g", 32)
 	return c
+}
+
+func validApplicationAuthConfig(t *testing.T) *Config {
+	t.Helper()
+	private := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, ed25519.SeedSize))
+	encoded, err := json.Marshal(map[string]string{"appctx-2026a": base64.RawURLEncoding.EncodeToString(private)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := minimalValid()
+	c.Routes[0].Auth = AuthApplication
+	c.ApplicationIntrospectionURL = "https://access-governance:8443/internal/v1/application-credentials/introspect"
+	c.ApplicationIntrospectionToken = strings.Repeat("t", 32)
+	c.ApplicationContextActiveKID = "appctx-2026a"
+	c.ApplicationContextSigningKeyring = string(encoded)
+	return c
+}
+
+func TestApplicationAuthConfigurationIsCompleteAndIndependent(t *testing.T) {
+	c := validApplicationAuthConfig(t)
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	for _, field := range []string{"url", "token", "kid", "keyring"} {
+		t.Run("missing-"+field, func(t *testing.T) {
+			invalid := validApplicationAuthConfig(t)
+			switch field {
+			case "url":
+				invalid.ApplicationIntrospectionURL = ""
+			case "token":
+				invalid.ApplicationIntrospectionToken = ""
+			case "kid":
+				invalid.ApplicationContextActiveKID = ""
+			case "keyring":
+				invalid.ApplicationContextSigningKeyring = ""
+			}
+			if err := invalid.Validate(); err == nil {
+				t.Fatal("partial application auth configuration accepted")
+			}
+		})
+	}
+
+	reused := validApplicationAuthConfig(t)
+	reused.GWClientSecret = reused.ApplicationIntrospectionToken
+	if err := reused.Validate(); err == nil {
+		t.Fatal("reused introspection credential accepted")
+	}
+}
+
+func TestApplyEnvApplicationAuth(t *testing.T) {
+	c := validApplicationAuthConfig(t)
+	t.Setenv(EnvApplicationIntrospectionURL, c.ApplicationIntrospectionURL)
+	t.Setenv(EnvApplicationIntrospectionToken, c.ApplicationIntrospectionToken)
+	t.Setenv(EnvApplicationContextActiveKID, c.ApplicationContextActiveKID)
+	t.Setenv(EnvApplicationContextSigningKeyring, c.ApplicationContextSigningKeyring)
+	got := minimalValid()
+	got.Routes[0].Auth = AuthApplication
+	got.ApplyEnv()
+	if err := got.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got.ApplicationIntrospectionURL != c.ApplicationIntrospectionURL || got.ApplicationContextActiveKID != c.ApplicationContextActiveKID {
+		t.Fatal("application auth environment was not applied")
+	}
 }
 
 func TestPermissionRouteDefaultsAndValidation(t *testing.T) {

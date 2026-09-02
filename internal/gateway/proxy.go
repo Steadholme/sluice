@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/holdfast/sluice/internal/application"
 	"github.com/holdfast/sluice/internal/auth"
 	"github.com/holdfast/sluice/internal/config"
 )
@@ -37,8 +38,8 @@ const (
 //   - strips every client-supplied X-Auth-* header, then injects the verified
 //     X-Auth-Subject / X-Auth-Scope from the auth context when present; PAT
 //     routes also receive a route-bound X-Auth-Scope-Sig.
-//   - on auth="pat" routes only, removes Authorization after introspection so
-//     the raw opaque credential terminates at Sluice.
+//   - on auth="pat" and auth="application" routes, removes Authorization after
+//     introspection so the raw opaque credential terminates at Sluice.
 //
 // Public routes have no auth context, so all X-Auth-* headers are simply
 // stripped and never re-added.
@@ -73,12 +74,17 @@ func newReverseProxy(
 			}
 
 			stripAuthHeaders(pr.Out.Header)
-			// Opaque PATs terminate at Sluice. Unlike the existing bearer/JWT path,
-			// a PAT route must never forward its raw Authorization credential to the
+			stripHeaderFamily(pr.Out.Header, "X-Application-")
+			stripHeaderFamily(pr.Out.Header, "X-Sponsor-Assertion")
+			// Opaque PAT and application credentials terminate at Sluice. Unlike the
+			// existing bearer/JWT path, these routes never forward Authorization to the
 			// upstream; identity and scope are conveyed only through Sluice-minted
 			// X-Auth-* headers (and the optional identity HMAC).
-			if route.Auth == config.AuthPAT {
+			if route.Auth == config.AuthPAT || route.Auth == config.AuthApplication {
 				pr.Out.Header.Del("Authorization")
+			}
+			if route.Auth == config.AuthApplication {
+				pr.Out.Header.Del("Cookie")
 			}
 			// Non-SSO routes are untrusted from the estate's point of view — most
 			// importantly the public SiteFlow-deployed sites served on *.w33d.xyz,
@@ -165,6 +171,18 @@ func newReverseProxy(
 				pr.Out.Header.Set(auth.HeaderAuthMFATimestamp, strconv.FormatInt(assertion.Timestamp, 10))
 				pr.Out.Header.Set(auth.HeaderAuthMFASig, signature)
 			}
+			if route.Auth == config.AuthApplication {
+				if signed, ok := application.SignedRequestFromContext(pr.In.Context()); ok {
+					for name, values := range signed.Headers() {
+						pr.Out.Header[name] = append([]string(nil), values...)
+					}
+				}
+			}
+			if assertion, ok := application.SponsorAssertionFromContext(pr.In.Context()); ok {
+				for name, values := range assertion.Headers() {
+					pr.Out.Header[name] = append([]string(nil), values...)
+				}
+			}
 		},
 	}
 	if mtls != nil && target.Scheme == "https" {
@@ -178,6 +196,14 @@ func stripAuthHeaders(h http.Header) {
 	for k := range h {
 		if strings.HasPrefix(http.CanonicalHeaderKey(k), authHeaderPrefix) {
 			delete(h, k)
+		}
+	}
+}
+
+func stripHeaderFamily(h http.Header, prefix string) {
+	for key := range h {
+		if strings.HasPrefix(http.CanonicalHeaderKey(key), prefix) {
+			delete(h, key)
 		}
 	}
 }
