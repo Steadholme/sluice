@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 )
 
 const maxApplicationBodyBytes = 9 << 20
@@ -40,6 +42,13 @@ func Middleware(introspector Introspector, requiredAudience, requiredScope strin
 
 func MiddlewareWithSigner(introspector Introspector, signer *ContextSigner, routeName, requiredAudience, requiredScope string, next http.Handler) http.Handler {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if routeName == "analyze-mcp" {
+			origins := r.Header.Values("Origin")
+			if len(origins) > 0 && (len(origins) != 1 || origins[0] != "https://analyze.w33d.xyz") {
+				writeError(w, http.StatusForbidden, "authorization_denied", false)
+				return
+			}
+		}
 		if introspector == nil {
 			writeError(w, http.StatusServiceUnavailable, "authentication_unavailable", true)
 			return
@@ -49,26 +58,37 @@ func MiddlewareWithSigner(introspector Introspector, signer *ContextSigner, rout
 			writeError(w, http.StatusUnauthorized, "unauthenticated", false)
 			return
 		}
-		sessionID, ok := applicationSessionIdentifier(r.Header)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "unauthenticated", false)
-			return
-		}
-		sessionHash := sha256.Sum256([]byte(sessionID))
-		sessionDigest := hex.EncodeToString(sessionHash[:])
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxApplicationBodyBytes+1))
 		if err != nil || len(body) > maxApplicationBodyBytes {
 			writeError(w, http.StatusBadRequest, "invalid_request", false)
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
+		sessionID, ok := applicationSessionIdentifier(r.Header)
+		inboundSession := ok
+		if !ok {
+			if len(r.Header.Values("Mcp-Session-Id")) != 0 || !validMcpInitialize(r, routeName, body) {
+				writeError(w, http.StatusUnauthorized, "unauthenticated", false)
+				return
+			}
+			sessionID, err = randomIdentifier("mcps_")
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, "authentication_unavailable", true)
+				return
+			}
+			r.Header.Set("Mcp-Session-Id", sessionID)
+		}
+		sessionHash := sha256.Sum256([]byte(sessionID))
+		sessionDigest := hex.EncodeToString(sessionHash[:])
 		result, err := introspector.Introspect(r.Context(), token, sessionDigest)
 		if err != nil {
 			switch {
 			case errors.Is(err, ErrInvalidToken):
 				writeError(w, http.StatusUnauthorized, "unauthenticated", false)
-			case errors.Is(err, ErrSessionInvalid):
+			case errors.Is(err, ErrSessionInvalid) && inboundSession:
 				writeError(w, http.StatusNotFound, "invalid_session", false)
+			case errors.Is(err, ErrSessionInvalid):
+				writeError(w, http.StatusUnauthorized, "unauthenticated", false)
 			default:
 				writeError(w, http.StatusServiceUnavailable, "authentication_unavailable", true)
 			}
@@ -172,6 +192,64 @@ func applicationSessionIdentifier(header http.Header) (string, bool) {
 		returnValue = values[0]
 	}
 	return returnValue, len(values) == 1 && validVisible(returnValue, 1, 256)
+}
+
+func validMcpInitialize(r *http.Request, routeName string, body []byte) bool {
+	if routeName != "analyze-mcp" || r.Method != http.MethodPost || r.URL.EscapedPath() != "/mcp" || r.URL.RawQuery != "" ||
+		len(body) > 1<<20 || !utf8.Valid(body) || !uniqueTopLevelJSONFields(body) {
+		return false
+	}
+	contentTypes := r.Header.Values("Content-Type")
+	if len(contentTypes) != 1 {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(contentTypes[0])
+	if err != nil || mediaType != "application/json" {
+		return false
+	}
+	acceptsJSON, acceptsStream := false, false
+	for _, header := range r.Header.Values("Accept") {
+		for _, value := range strings.Split(header, ",") {
+			kind, _, err := mime.ParseMediaType(strings.TrimSpace(value))
+			if err != nil {
+				return false
+			}
+			acceptsJSON = acceptsJSON || kind == "application/json"
+			acceptsStream = acceptsStream || kind == "text/event-stream"
+		}
+	}
+	versions := r.Header.Values("Mcp-Protocol-Version")
+	if !acceptsJSON || !acceptsStream || (len(versions) != 0 && (len(versions) != 1 || versions[0] != "2025-11-25")) {
+		return false
+	}
+	var request struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(body, &request) != nil || request.JSONRPC != "2.0" || request.Method != "initialize" || !uniqueTopLevelJSONFields(request.Params) {
+		return false
+	}
+	var id any
+	if json.Unmarshal(request.ID, &id) != nil {
+		return false
+	}
+	switch id.(type) {
+	case string, float64:
+	default:
+		return false
+	}
+	var params struct {
+		ProtocolVersion string                     `json:"protocolVersion"`
+		Capabilities    map[string]json.RawMessage `json:"capabilities"`
+		ClientInfo      struct {
+			Name    *string `json:"name"`
+			Version *string `json:"version"`
+		} `json:"clientInfo"`
+	}
+	return json.Unmarshal(request.Params, &params) == nil && params.ProtocolVersion == "2025-11-25" &&
+		params.Capabilities != nil && params.ClientInfo.Name != nil && params.ClientInfo.Version != nil
 }
 
 func randomIdentifier(prefix string) (string, error) {
