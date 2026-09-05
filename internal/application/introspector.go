@@ -60,7 +60,7 @@ type Result struct {
 }
 
 type Introspector interface {
-	Introspect(context.Context, string, string) (Result, error)
+	Introspect(context.Context, string, string, bool) (Result, error)
 }
 
 type IntrospectorConfig struct {
@@ -124,11 +124,14 @@ type activeIntrospectionResponse struct {
 	RevocationEpoch       int64           `json:"revocation_epoch"`
 }
 
-func (i *AccessIntrospector) Introspect(ctx context.Context, token, sessionDigest string) (Result, error) {
+func (i *AccessIntrospector) Introspect(ctx context.Context, token, sessionDigest string, initialize bool) (Result, error) {
 	if !credentialPattern.MatchString(token) || !hexDigestPattern.MatchString(sessionDigest) {
 		return Result{}, ErrInvalidToken
 	}
 	form := url.Values{"mcp_session_digest": {sessionDigest}, "token": {token}}
+	if initialize {
+		form.Set("initialize", "true")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, i.endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return Result{}, unavailable(err)

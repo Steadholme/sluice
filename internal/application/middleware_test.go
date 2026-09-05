@@ -6,11 +6,15 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 type stubIntrospector struct {
@@ -20,13 +24,103 @@ type stubIntrospector struct {
 	sessionDigest string
 }
 
-func (s *stubIntrospector) Introspect(_ context.Context, _, sessionDigest string) (Result, error) {
+func (s *stubIntrospector) Introspect(_ context.Context, _, sessionDigest string, _ bool) (Result, error) {
 	s.calls++
 	s.sessionDigest = sessionDigest
 	return s.result, s.err
 }
 
 const testInitializeBody = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"standard-client","version":"1.0"}}}`
+
+func TestOnlyGeneratedInitializeSendsAuthenticatedSupersedeIntent(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/application_introspection_active_v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(fixture, &payload); err != nil {
+		t.Fatal(err)
+	}
+	payload["credential_version"] = 2
+	response, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forms := make(chan url.Values, 1)
+	access := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+strings.Repeat("s", 32) || r.ParseForm() != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		forms <- r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(response)
+	}))
+	defer access.Close()
+	introspector, err := NewAccessIntrospector(IntrospectorConfig{
+		Endpoint: access.URL, ServiceToken: strings.Repeat("s", 32), Client: access.Client(),
+		Now: func() time.Time { return time.Unix(1_900_000_000, 0) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	private := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, ed25519.SeedSize))
+	signer, err := NewContextSigner(SigningKeyring{ActiveKID: "initialize-test", PrivateKeys: map[string]ed25519.PrivateKey{"initialize-test": private}}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, method, path, route, body, session string
+		initialize                               bool
+	}{
+		{name: "new initialize", method: http.MethodPost, path: "/mcp", route: "analyze-mcp", body: testInitializeBody, initialize: true},
+		{name: "caller session initialize", method: http.MethodPost, path: "/mcp", route: "analyze-mcp", body: testInitializeBody, session: "session_original"},
+		{name: "ordinary spoofed body", method: http.MethodPost, path: "/mcp?initialize=true", route: "analyze-mcp", body: `{"jsonrpc":"2.0","id":2,"method":"tools/list","initialize":true}`, session: "session_original"},
+		{name: "get", method: http.MethodGet, path: "/mcp", route: "analyze-mcp", session: "session_original"},
+		{name: "delete", method: http.MethodDelete, path: "/mcp", route: "analyze-mcp", session: "session_original"},
+		{name: "upload", method: http.MethodPost, path: "/v1/uploads/test/finalize", route: "analyze-uploads", session: "session_original"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var signedContext ContextV1
+			var sessionID string
+			handler := MiddlewareWithSigner(introspector, signer, tc.route, "analyze-facade", "", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				signed, ok := SignedRequestFromContext(r.Context())
+				if !ok {
+					t.Fatal("missing signed context")
+				}
+				signedContext = signed.Context
+				sessionID = r.Header.Get("Mcp-Session-Id")
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			req := httptest.NewRequest(tc.method, "https://analyze.w33d.xyz"+tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+testApplicationToken)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			req.Header.Set("X-Application-Initialize", "true")
+			req.Header.Set("Initialize", "true")
+			if tc.session != "" {
+				req.Header.Set("Mcp-Session-Id", tc.session)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("status=%d", rec.Code)
+			}
+			form := <-forms
+			wantFields := 2
+			if tc.initialize {
+				wantFields = 3
+			}
+			if len(form) != wantFields || (form.Get("initialize") == "true") != tc.initialize {
+				t.Fatalf("initialize=%q field_count=%d; want initialize=%v field_count=%d", form.Get("initialize"), len(form), tc.initialize, wantFields)
+			}
+			digest := sha256.Sum256([]byte(sessionID))
+			if form.Get("mcp_session_digest") != hex.EncodeToString(digest[:]) || signedContext.MCPSessionDigest != form.Get("mcp_session_digest") || signedContext.CredentialVersion != 2 {
+				t.Fatal("Access session digest and updated credential version must reach signed context unchanged")
+			}
+		})
+	}
+}
 
 func TestApplicationMiddlewareMapsFrozenErrorsAndDoesNotDispatchOnOutage(t *testing.T) {
 	for _, tc := range []struct {

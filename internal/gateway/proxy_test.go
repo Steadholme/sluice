@@ -36,7 +36,7 @@ type gatewayApplicationIntrospector struct {
 	calls  int
 }
 
-func (i *gatewayApplicationIntrospector) Introspect(context.Context, string, string) (application.Result, error) {
+func (i *gatewayApplicationIntrospector) Introspect(context.Context, string, string, bool) (application.Result, error) {
 	i.calls++
 	return i.result, i.err
 }

@@ -80,7 +80,7 @@ func MiddlewareWithSigner(introspector Introspector, signer *ContextSigner, rout
 		}
 		sessionHash := sha256.Sum256([]byte(sessionID))
 		sessionDigest := hex.EncodeToString(sessionHash[:])
-		result, err := introspector.Introspect(r.Context(), token, sessionDigest)
+		result, err := introspector.Introspect(r.Context(), token, sessionDigest, !inboundSession)
 		if err != nil {
 			switch {
 			case errors.Is(err, ErrInvalidToken):

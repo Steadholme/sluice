@@ -62,7 +62,7 @@ func TestAccessApplicationIntrospectionSharedKnownVector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64))
+	result, err := client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestApplicationIntrospectionRequiresEqualSubjectEpochsAndCredentialState(t 
 		t.Fatal(err)
 	}
 	for range 2 {
-		result, err := client.Introspect(context.Background(), testApplicationToken, sessionDigest)
+		result, err := client.Introspect(context.Background(), testApplicationToken, sessionDigest, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -156,7 +156,7 @@ func TestApplicationIntrospectionInactiveIsExactAndFailuresAreUnavailable(t *tes
 			if err != nil {
 				t.Fatal(err)
 			}
-			result, err := client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64))
+			result, err := client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64), false)
 			if index == 0 {
 				if err != nil || result.Active {
 					t.Fatalf("inactive result=%+v err=%v", result, err)
@@ -186,11 +186,11 @@ func TestApplicationIntrospectionAcceptsOnlyEligibleOriginalSessionOverlap(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64))
+	result, err := client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64), false)
 	if err != nil || result.CredentialState != CredentialOverlap || result.OverlapUntil == nil || *result.OverlapUntil != 1_900_000_030 {
 		t.Fatalf("eligible overlap result=%+v err=%v", result, err)
 	}
-	if _, err := client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64)); err == nil || !strings.Contains(err.Error(), ErrUnavailable.Error()) {
+	if _, err := client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64), false); err == nil || !strings.Contains(err.Error(), ErrUnavailable.Error()) {
 		t.Fatalf("expired overlap err=%v", err)
 	}
 }
@@ -219,7 +219,7 @@ func TestApplicationIntrospectionMapsOnlyExactConflictInactiveToInvalidSession(t
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64))
+			_, err = client.Introspect(context.Background(), testApplicationToken, strings.Repeat("a", 64), false)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("err=%v want=%v", err, tc.want)
 			}
